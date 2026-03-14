@@ -9,7 +9,8 @@
     "dev:web": "pnpm --filter @openclaw/web dev",
     "build:web": "pnpm --filter @openclaw/web build",
     "build:frontend": "bash scripts/build_frontend.sh",
-    "plugin:install": "powershell -ExecutionPolicy Bypass -File ./scripts/install_openclaw_plugin.ps1",
+    "plugin:install": "powershell -ExecutionPolicy Bypass -File ./scripts/install_openclaw_plugin.ps1 -Mode dev",
+    "plugin:install:copy": "powershell -ExecutionPolicy Bypass -File ./scripts/install_openclaw_plugin.ps1 -Mode copy -Force",
     "plugin:test": "tsx --test extensions/openclaw-orchestrator/tests/tools.test.ts"
   },
   "devDependencies": {

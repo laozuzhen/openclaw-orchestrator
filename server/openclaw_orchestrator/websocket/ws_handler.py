@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from concurrent.futures import Future
 from typing import Any
 
 from fastapi import WebSocket
 
 # Connected WebSocket clients
-_clients: set[WebSocket] = set()
+_clients: dict[WebSocket, float] = {}
 _main_loop: asyncio.AbstractEventLoop | None = None
+HEARTBEAT_INTERVAL = 15.0
+HEARTBEAT_TIMEOUT = 45.0
+logger = logging.getLogger(__name__)
 
 
 async def handle_ws_connection(websocket: WebSocket) -> None:
@@ -24,9 +28,10 @@ async def handle_ws_connection(websocket: WebSocket) -> None:
     global _main_loop
 
     await websocket.accept()
-    _main_loop = asyncio.get_running_loop()
-    _clients.add(websocket)
-    print("WebSocket client connected")
+    loop = asyncio.get_running_loop()
+    _main_loop = loop
+    _clients[websocket] = loop.time()
+    logger.info("WebSocket client connected (total: %d)", len(_clients))
 
     # Send welcome message
     await websocket.send_json(
@@ -54,6 +59,34 @@ async def handle_ws_connection(websocket: WebSocket) -> None:
                 "timestamp": _now(),
             }
         )
+
+        gateway_error = gateway_payload.get("error") if isinstance(gateway_payload, dict) else None
+        if isinstance(gateway_error, str) and gateway_error.strip():
+            event_timestamp = _now()
+            communication_payload: dict[str, Any] = {
+                "id": f"gateway-error-replay-{event_timestamp}",
+                "fromAgentId": "gateway",
+                "toAgentId": "gateway.error",
+                "type": "broadcast",
+                "eventType": "gateway.error",
+                "content": gateway_error.strip(),
+                "message": gateway_error.strip(),
+                "error": gateway_error.strip(),
+                "timestamp": event_timestamp,
+            }
+            code = gateway_payload.get("code")
+            if isinstance(code, str) and code.strip():
+                communication_payload["code"] = code.strip()
+            if gateway_payload.get("authRequired"):
+                communication_payload["authRequired"] = True
+
+            await websocket.send_json(
+                {
+                    "type": "communication",
+                    "payload": communication_payload,
+                    "timestamp": event_timestamp,
+                }
+            )
     except Exception:
         pass
 
@@ -69,6 +102,10 @@ async def handle_ws_connection(websocket: WebSocket) -> None:
         pass
     finally:
         heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
         _clients.pop(websocket, None)
         logger.info("WebSocket client disconnected (total: %d)", len(_clients))
 
@@ -76,13 +113,14 @@ async def handle_ws_connection(websocket: WebSocket) -> None:
 async def _heartbeat_loop(websocket: WebSocket) -> None:
     """Periodically send ping messages and check for pong responses."""
     try:
+        loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
             # Check if client responded to last ping
             last_pong = _clients.get(websocket)
             if last_pong is not None:
-                elapsed = asyncio.get_event_loop().time() - last_pong
+                elapsed = loop.time() - last_pong
                 if elapsed > HEARTBEAT_TIMEOUT:
                     logger.warning(
                         "WebSocket client heartbeat timeout (%.1fs), closing",
@@ -112,7 +150,7 @@ async def _handle_client_message(ws: WebSocket, message: Any) -> None:
 
     if msg_type == "pong":
         # Update last pong timestamp
-        _clients[ws] = asyncio.get_event_loop().time()
+        _clients[ws] = asyncio.get_running_loop().time()
         return
 
     logger.debug("Received client message: %s", message)
@@ -133,7 +171,7 @@ def broadcast(event: dict[str, Any]) -> None:
 
     async def _do_broadcast() -> None:
         dead_clients: set[WebSocket] = set()
-        for client in _clients.copy():
+        for client in list(_clients):
             try:
                 await client.send_text(data)
             except Exception:

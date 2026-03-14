@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactFlow, {
   Background,
   Controls,
@@ -34,13 +34,14 @@ import {
   getExecutionBadge,
   normalizeConditionHandle,
   normalizeSchedule,
-  serializeEdges,
-  serializeNodes,
   toDateTimeLocalValue,
   toFlowEdges,
   toFlowNodes,
   upsertConnectedEdge,
 } from '@/pages/workflow-editor/graph'
+import { haveWorkflowGraphChanges, prepareWorkflowGraphForSave } from '@/pages/workflow-editor/graph-persistence'
+import { createDefaultWorkflowNodeData } from '@/pages/workflow-editor/node-defaults'
+import { getWorkflowNodeInstructionManual } from '@/pages/workflow-editor/node-instructions'
 import { WORKFLOW_NODE_BUTTONS, workflowNodeTypes } from '@/pages/workflow-editor/shared'
 
 function ScheduleToggle({
@@ -101,8 +102,15 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
   const [agents, setAgents] = useState<AgentListItem[]>([])
   const [schedule, setSchedule] = useState<WorkflowSchedule>(createDefaultSchedule())
   const [edgeReconnectSuccessful, setEdgeReconnectSuccessful] = useState(true)
+  const selectedWorkflowIdRef = useRef<string | null>(null)
+  const graphAutosaveRequestIdRef = useRef(0)
+  const lastGraphAutosaveErrorRef = useRef<string | null>(null)
 
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedNodeId) ?? null, [nodes, selectedNodeId])
+  const selectedNodeInstructionManual = useMemo(
+    () => getWorkflowNodeInstructionManual((selectedNode?.data as WorkflowNodeData | undefined)?.type),
+    [selectedNode],
+  )
   const executionIsActive = useMemo(() => isExecutionActive(execution?.status), [execution?.status])
   const selectedNodeUpstreamOptions = useMemo(() => {
     if (!selectedNodeId) return []
@@ -189,6 +197,10 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
     setExecution(null)
   }, [setEdges, setNodes])
 
+  useEffect(() => {
+    selectedWorkflowIdRef.current = selected?.id ?? null
+  }, [selected?.id])
+
   const fetchWorkflows = useCallback(async () => {
     try {
       const all = await api.get<WorkflowDefinition[]>('/workflows')
@@ -263,6 +275,78 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
 
     void fetchAgentOptions()
   }, [])
+
+  useEffect(() => {
+    if (!selected?.id) {
+      lastGraphAutosaveErrorRef.current = null
+      return undefined
+    }
+
+    if (!haveWorkflowGraphChanges(nodes, edges, selected)) {
+      lastGraphAutosaveErrorRef.current = null
+      return undefined
+    }
+
+    const workflowId = selected.id
+    const draftNodes = nodes
+    const draftEdges = edges
+    const timer = window.setTimeout(() => {
+      const prepared = prepareWorkflowGraphForSave(draftNodes, draftEdges)
+      lastGraphAutosaveErrorRef.current = null
+      const requestId = ++graphAutosaveRequestIdRef.current
+
+      void api
+        .put<WorkflowDefinition>(`/workflows/${workflowId}`, {
+          nodes: prepared.nodes,
+          edges: prepared.edges,
+        })
+        .then((updated) => {
+          if (selectedWorkflowIdRef.current !== workflowId || requestId !== graphAutosaveRequestIdRef.current) {
+            return
+          }
+
+          setSelected((current) =>
+            current?.id === updated.id
+              ? {
+                  ...current,
+                  nodes: updated.nodes,
+                  edges: updated.edges,
+                }
+              : current,
+          )
+          setWorkflows((current) =>
+            current.map((workflow) =>
+              workflow.id === updated.id
+                ? {
+                    ...workflow,
+                    nodes: updated.nodes,
+                    edges: updated.edges,
+                  }
+                : workflow,
+            ),
+          )
+        })
+        .catch((error) => {
+          if (selectedWorkflowIdRef.current !== workflowId || requestId !== graphAutosaveRequestIdRef.current) {
+            return
+          }
+
+          const message = error instanceof Error ? error.message : '未知错误'
+          const errorKey = `${workflowId}:${message}`
+          if (lastGraphAutosaveErrorRef.current === errorKey) {
+            return
+          }
+          lastGraphAutosaveErrorRef.current = errorKey
+          toast({
+            title: '工作流保存失败',
+            description: message,
+            variant: 'destructive',
+          })
+        })
+    }, 800)
+
+    return () => window.clearTimeout(timer)
+  }, [edges, nodes, selected])
 
   useEffect(() => {
     if (!execution || !ACTIVE_EXECUTION_STATUSES.includes(execution.status)) {
@@ -388,20 +472,13 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
       return
     }
 
-    const nodeMap = serializeNodes(nodes, edges)
-    Object.keys(nodeMap).forEach((nodeId) => {
-      nodeMap[nodeId] = {
-        ...nodeMap[nodeId],
-        label: (nodeMap[nodeId].label || nodeId).trim(),
-      }
-    })
-    const edgeList = serializeEdges(edges)
+    const preparedGraph = prepareWorkflowGraphForSave(nodes, edges)
 
     try {
       const updated = await api.put<WorkflowDefinition>(`/workflows/${selected.id}`, {
         name: selected.name,
-        nodes: nodeMap,
-        edges: edgeList,
+        nodes: preparedGraph.nodes,
+        edges: preparedGraph.edges,
         schedule: nextSchedule,
       })
       setSelected(updated)
@@ -421,21 +498,13 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
 
   const addNode = (type: WorkflowNodeData['type']) => {
     const id = `${type}-${Date.now()}`
-    const baseData: Record<WorkflowNodeData['type'], WorkflowNodeData> = {
-      task: { type: 'task', label: '任务节点', agentId: '', task: '', timeoutSeconds: 60, requireResponse: true, requireArtifacts: false, minOutputLength: 1, successPattern: '', position: { x: 240, y: 120 } },
-      condition: { type: 'condition', label: '条件节点', expression: 'true', branches: { yes: '', no: '' }, position: { x: 240, y: 120 } },
-      approval: { type: 'approval', label: '审批节点', title: '请确认', description: '', approver: 'web-user', timeoutMinutes: 30, onTimeout: 'reject', position: { x: 240, y: 120 } },
-      join: { type: 'join', label: '汇合节点', joinMode: 'and', waitForAll: true, position: { x: 240, y: 120 } },
-      parallel: { type: 'parallel', label: '并行节点', joinMode: 'and', waitForAll: true, position: { x: 240, y: 120 } },
-      meeting: { type: 'meeting', label: '会议节点', meetingType: 'brainstorm', topic: '', participants: [], position: { x: 240, y: 120 } },
-      debate: { type: 'debate', label: '辩论节点', topic: '', participants: [], maxRounds: 3, position: { x: 240, y: 120 } },
-    }
+    const nodeData = createDefaultWorkflowNodeData(type)
 
     const nextNode: Node = {
       id,
       type,
       position: { x: 180 + nodes.length * 30, y: 100 + nodes.length * 20 },
-      data: baseData[type],
+      data: nodeData,
     }
 
     setNodes((prev) => [...prev, nextNode])
@@ -698,6 +767,15 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>
+                      {selectedNodeInstructionManual ? (
+                        <div className="space-y-2 rounded-xl border border-white/8 bg-cyber-bg/25 p-3">
+                          <div className="space-y-1">
+                            <p className="text-xs font-medium text-white/80">运行时说明书</p>
+                            <p className="text-[11px] text-white/45">执行时自动拼接到节点任务中，只读展示，不会写回节点内容。</p>
+                          </div>
+                          <pre className="whitespace-pre-wrap break-words rounded-lg border border-white/6 bg-black/15 p-3 text-[11px] leading-5 text-white/70">{selectedNodeInstructionManual}</pre>
+                        </div>
+                      ) : null}
                       {(selectedNode.data as WorkflowNodeData).type === 'task' ? (
                         <>
                           <div className="space-y-2">
@@ -726,9 +804,15 @@ export function TeamWorkflowEditor({ teamId }: TeamWorkflowEditorProps) {
                             <Label className="text-xs text-white/60">任务内容</Label>
                             <textarea value={(selectedNode.data as any).task || ''} onChange={(event) => updateSelectedNode({ task: event.target.value } as Partial<WorkflowNodeData>)} placeholder="要发送给 Agent 的任务内容" className="min-h-28 w-full resize-y rounded-lg border border-white/10 bg-cyber-bg px-3 py-2 text-sm text-white outline-none" />
                           </div>
-                          <div className="space-y-2">
-                            <Label className="text-xs text-white/60">超时时间（秒）</Label>
-                            <Input type="number" min={1} value={(selectedNode.data as any).timeoutSeconds ?? 60} onChange={(event) => updateSelectedNode({ timeoutSeconds: Number(event.target.value || 60) } as Partial<WorkflowNodeData>)} placeholder="timeoutSeconds" className="border-white/10 bg-cyber-bg text-white" />
+                          <div className="grid grid-cols-2 gap-3">
+                            <div className="space-y-2">
+                              <Label className="text-xs text-white/60">超时时间（秒）</Label>
+                              <Input type="number" min={1} value={(selectedNode.data as any).timeoutSeconds ?? 60} onChange={(event) => updateSelectedNode({ timeoutSeconds: Number(event.target.value || 60) } as Partial<WorkflowNodeData>)} placeholder="timeoutSeconds" className="border-white/10 bg-cyber-bg text-white" />
+                            </div>
+                            <div className="space-y-2">
+                              <Label className="text-xs text-white/60">最大重试次数</Label>
+                              <Input type="number" min={0} value={(selectedNode.data as any).maxRetries ?? 0} onChange={(event) => updateSelectedNode({ maxRetries: Math.max(0, Number(event.target.value || 0)) } as Partial<WorkflowNodeData>)} placeholder="0" className="border-white/10 bg-cyber-bg text-white" />
+                            </div>
                           </div>
                           <div className="grid grid-cols-2 gap-3 rounded-lg border border-white/5 bg-cyber-bg/30 p-3">
                             <label className="flex items-center gap-2 text-xs text-white/70">

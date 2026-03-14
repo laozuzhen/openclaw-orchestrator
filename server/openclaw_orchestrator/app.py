@@ -14,7 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from openclaw_orchestrator.config import settings
@@ -199,6 +199,7 @@ app.include_router(collaboration_router, prefix="/api")
 
 
 # ─── Health check ───
+@app.get("/health")
 @app.get("/api/health")
 def health_check():
     from openclaw_orchestrator.services.gateway_connector import gateway_connector

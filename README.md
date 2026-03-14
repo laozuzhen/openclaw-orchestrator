@@ -306,6 +306,29 @@ bash scripts/dev.sh
 # ⚡ Vite 前端：http://localhost:5173（HMR）
 ```
 
+### OpenClaw 插件联调
+
+默认推荐开发态挂载，避免每次改插件都复制文件：
+
+```bash
+pnpm plugin:test
+pnpm plugin:install
+```
+
+这会自动把当前仓库中的 `extensions/openclaw-orchestrator` 写入 `~/.openclaw/openclaw.json` 的 `plugins.load.paths`，并启用插件配置。之后只要 OpenClaw 重新加载插件，就会直接使用当前仓库代码。
+
+如果你需要复制安装一份独立副本：
+
+```bash
+pnpm plugin:install:copy
+```
+
+也可以指定后端地址：
+
+```bash
+powershell -ExecutionPolicy Bypass -File ./scripts/install_openclaw_plugin.ps1 -Mode dev -BaseUrl http://127.0.0.1:3721
+```
+
 ---
 
 ## 🧰 技术栈

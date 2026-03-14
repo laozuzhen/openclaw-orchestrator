@@ -83,7 +83,7 @@ class WorkflowScheduler:
                 continue
 
             active_workflow_ids.add(workflow_id)
-            signature = json.dumps(schedule, ensure_ascii=False, sort_keys=True)
+            signature = self._build_workflow_signature(workflow, schedule)
             state = self._states.get(workflow_id)
             if state is None or state.get("signature") != signature:
                 self._states[workflow_id] = {
@@ -158,7 +158,7 @@ class WorkflowScheduler:
             return None
 
         current_time = now_utc or datetime.now(timezone.utc)
-        signature = json.dumps(schedule, ensure_ascii=False, sort_keys=True)
+        signature = self._build_workflow_signature(workflow, schedule)
         state = self._states.get(workflow_id)
         candidate = (
             state.get("next_run_at")
@@ -230,6 +230,18 @@ class WorkflowScheduler:
             "activeFrom": raw.get("activeFrom"),
             "activeUntil": raw.get("activeUntil"),
         }
+
+    def _build_workflow_signature(
+        self,
+        workflow: dict[str, Any],
+        schedule: dict[str, Any],
+    ) -> str:
+        signature_payload = {
+            "schedule": schedule,
+            "nodes": workflow.get("nodes") or {},
+            "edges": workflow.get("edges") or [],
+        }
+        return json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, default=str)
 
     def _compute_next_run_at(
         self,

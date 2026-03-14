@@ -4,6 +4,7 @@ import { Loader2, Merge, MessageSquare, Play, Save, Split, Square, Swords, UserC
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { WorkflowExecution, WorkflowNodeData } from '@/types'
+import { getWorkflowToolbarLayoutClasses } from './toolbar-layout'
 
 interface WorkflowToolbarProps {
   execution: WorkflowExecution | null
@@ -31,9 +32,10 @@ export const WorkflowToolbar = React.memo(function WorkflowToolbar({
   onStop,
   onSave,
 }: WorkflowToolbarProps) {
+  const { bottomPanelShellClassName, bottomPanelCardClassName } = getWorkflowToolbarLayoutClasses()
+
   return (
     <>
-      {/* Top toolbar — node add buttons */}
       <Panel position="top-left" className="flex gap-2">
         {NODE_BUTTONS.map(({ type, icon, label, hoverClass }) => (
           <button
@@ -41,7 +43,7 @@ export const WorkflowToolbar = React.memo(function WorkflowToolbar({
             onClick={() => onAddNode(type)}
             className={cn(
               'cartoon-card flex items-center gap-1.5 px-3 py-2 text-xs text-white/50 hover:text-white transition-all cursor-pointer',
-              hoverClass
+              hoverClass,
             )}
           >
             {icon} {label}
@@ -49,66 +51,67 @@ export const WorkflowToolbar = React.memo(function WorkflowToolbar({
         ))}
       </Panel>
 
-      {/* Bottom controls — execute / stop / save */}
-      <Panel position="bottom-center" className="flex items-center gap-3 cartoon-card px-4 py-2.5">
-        <Button
-          size="sm"
-          onClick={onExecute}
-          disabled={execution?.status === 'running'}
-          className="bg-cyber-green/15 text-cyber-green border border-cyber-green/25 hover:bg-cyber-green/25 h-8 rounded-lg"
-        >
-          {execution?.status === 'running' ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />
-          ) : (
-            <Play className="w-3.5 h-3.5 mr-1" />
-          )}
-          执行
-        </Button>
-        <Button
-          size="sm"
-          onClick={onStop}
-          disabled={!execution || execution.status !== 'running'}
-          variant="destructive"
-          className="h-8 rounded-lg"
-        >
-          <Square className="w-3.5 h-3.5 mr-1" /> 停止
-        </Button>
-        <div className="w-px h-5 bg-white/8" />
-        <Button
-          size="sm"
-          onClick={onSave}
-          disabled={saving}
-          className="bg-cyber-purple/15 text-cyber-lavender border border-cyber-purple/25 hover:bg-cyber-purple/25 h-8 rounded-lg"
-        >
-          {saving ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />
-          ) : (
-            <Save className="w-3.5 h-3.5 mr-1" />
-          )}
-          保存
-        </Button>
-        {execution && (
-          <span
-            className={cn(
-              'text-[10px] px-2 py-0.5 rounded-full border',
-              execution.status === 'running'
-                ? 'bg-cyber-green/10 text-cyber-green border-cyber-green/20 animate-pulse'
-                : execution.status === 'completed'
-                  ? 'bg-cyber-blue/10 text-cyber-blue border-cyber-blue/20'
-                  : execution.status === 'failed'
-                    ? 'bg-red-500/10 text-red-300 border-red-500/20'
-                    : 'bg-white/5 text-white/40 border-white/10'
-            )}
+      <Panel position="bottom-center" className={bottomPanelShellClassName}>
+        <div className={bottomPanelCardClassName}>
+          <Button
+            size="sm"
+            onClick={onExecute}
+            disabled={execution?.status === 'running'}
+            className="h-8 rounded-lg border border-cyber-green/25 bg-cyber-green/15 text-cyber-green hover:bg-cyber-green/25"
           >
-            {execution.status === 'running'
-              ? '运行中'
-              : execution.status === 'completed'
-                ? '已完成'
-                : execution.status === 'failed'
-                  ? '失败'
-                  : execution.status}
-          </span>
-        )}
+            {execution?.status === 'running' ? (
+              <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Play className="mr-1 h-3.5 w-3.5" />
+            )}
+            执行
+          </Button>
+          <Button
+            size="sm"
+            onClick={onStop}
+            disabled={!execution || execution.status !== 'running'}
+            variant="destructive"
+            className="h-8 rounded-lg"
+          >
+            <Square className="mr-1 h-3.5 w-3.5" /> 停止
+          </Button>
+          <div className="h-5 w-px bg-white/8" />
+          <Button
+            size="sm"
+            onClick={onSave}
+            disabled={saving}
+            className="h-8 rounded-lg border border-cyber-purple/25 bg-cyber-purple/15 text-cyber-lavender hover:bg-cyber-purple/25"
+          >
+            {saving ? (
+              <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Save className="mr-1 h-3.5 w-3.5" />
+            )}
+            保存
+          </Button>
+          {execution && (
+            <span
+              className={cn(
+                'rounded-full border px-2 py-0.5 text-[10px]',
+                execution.status === 'running'
+                  ? 'animate-pulse border-cyber-green/20 bg-cyber-green/10 text-cyber-green'
+                  : execution.status === 'completed'
+                    ? 'border-cyber-blue/20 bg-cyber-blue/10 text-cyber-blue'
+                    : execution.status === 'failed'
+                      ? 'border-red-500/20 bg-red-500/10 text-red-300'
+                      : 'border-white/10 bg-white/5 text-white/40',
+              )}
+            >
+              {execution.status === 'running'
+                ? '运行中'
+                : execution.status === 'completed'
+                  ? '已完成'
+                  : execution.status === 'failed'
+                    ? '失败'
+                    : execution.status}
+            </span>
+          )}
+        </div>
       </Panel>
     </>
   )

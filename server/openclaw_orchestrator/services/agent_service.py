@@ -31,6 +31,7 @@ class AgentService:
     def list_agents(self) -> list[dict[str, Any]]:
         """List all agents with basic info."""
         agent_dirs = file_manager.list_agent_dirs()
+        self.sync_runtime_agents_config(agent_dirs)
         result = []
         for dir_name in agent_dirs:
             identity = self._read_identity(dir_name)
@@ -156,6 +157,24 @@ class AgentService:
             raise ValueError(f"Agent not found: {agent_id}")
         shutil.rmtree(full_path)
         self._update_openclaw_config(agent_id, "remove")
+
+    def ensure_runtime_agent_registered(self, agent_id: str) -> None:
+        """Ensure an existing agent directory is registered in openclaw.json."""
+        normalized_agent_id = str(agent_id or "").strip()
+        if not normalized_agent_id:
+            return
+        if normalized_agent_id not in file_manager.list_agent_dirs():
+            return
+        self._update_openclaw_config(normalized_agent_id, "add")
+
+    def sync_runtime_agents_config(self, agent_ids: Optional[list[str]] = None) -> None:
+        """Ensure all on-disk agent directories exist in openclaw.json -> agents.list."""
+        resolved_agent_ids = agent_ids if agent_ids is not None else file_manager.list_agent_dirs()
+        for agent_id in resolved_agent_ids:
+            normalized_agent_id = str(agent_id or "").strip()
+            if not normalized_agent_id:
+                continue
+            self._update_openclaw_config(normalized_agent_id, "add")
 
     # ─── Private helpers ───
 
@@ -300,16 +319,21 @@ class AgentService:
         def _matches(a: dict) -> bool:
             return a.get("id") == agent_id or a.get("name") == agent_id
 
+        changed = False
         if action == "add":
             exists = any(_matches(a) for a in oc_config["agents"]["list"])
             if not exists:
                 oc_config["agents"]["list"].append({"id": agent_id})
+                changed = True
         else:
-            oc_config["agents"]["list"] = [
+            updated_agents = [
                 a for a in oc_config["agents"]["list"] if not _matches(a)
             ]
+            changed = len(updated_agents) != len(oc_config["agents"]["list"])
+            oc_config["agents"]["list"] = updated_agents
 
-        file_manager.write_json(config_path, oc_config)
+        if changed:
+            file_manager.write_json(config_path, oc_config)
 
 
 # Singleton instance

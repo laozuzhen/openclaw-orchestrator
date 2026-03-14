@@ -101,6 +101,7 @@ export type NotificationType =
   | 'approval_required'
   | 'node_completed'
   | 'workflow_completed'
+  | 'workflow_warning'
   | 'workflow_error'
 
 export interface Notification {

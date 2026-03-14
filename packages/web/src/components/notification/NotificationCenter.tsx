@@ -25,6 +25,8 @@ function getNotificationIcon(type: string) {
       return <Zap className="w-3 h-3" />
     case 'workflow_completed':
       return <CheckCircle className="w-3 h-3" />
+    case 'workflow_warning':
+      return <AlertCircle className="w-3 h-3" />
     case 'workflow_error':
       return <AlertCircle className="w-3 h-3" />
     default:
@@ -40,6 +42,8 @@ function getNotificationColor(type: string) {
       return 'text-blue-400 bg-blue-400'
     case 'workflow_completed':
       return 'text-green-500 bg-green-500'
+    case 'workflow_warning':
+      return 'text-yellow-500 bg-yellow-500'
     case 'workflow_error':
       return 'text-red-500 bg-red-500'
     default:

@@ -1,13 +1,27 @@
-import { createElement, useCallback, useEffect, useRef } from 'react'
+import { createElement, useCallback, useEffect, useRef, useState } from 'react'
 import { ToastAction, type ToastActionElement } from '@/components/ui/toast'
 import { toast } from '@/hooks/use-toast'
 import { api } from '@/lib/api'
 import { buildHumanApprovalReminder, getApprovalReminderKey } from '@/lib/approval-reminders'
+import {
+  collectHumanApprovalReminderSurfaces,
+  collectRecentUnreadSnapshotNotifications,
+  resolveMonitorPollInterval,
+} from '@/lib/monitor-convergence'
+import { normalizeRealtimeMessage, parseRealtimeSessionKey } from '@/lib/realtime-message'
 import { gatewayRuntimeFromHealth, mergeGatewayRuntimeStatus, resolveGatewayConnectedFromHealth } from '@/lib/gateway-status'
 import { wsClient } from '@/lib/websocket'
 import { useAgentStore } from '@/stores/agent-store'
 import { useMonitorStore } from '@/stores/monitor-store'
-import type { AgentStatus, GatewayRuntimeStatus, LiveFeedSnapshot, Notification, SessionMessage, WorkflowRuntimeSignal } from '@/types'
+import type {
+  AgentStatus,
+  ApprovalUpdatePayload,
+  GatewayRuntimeStatus,
+  LiveFeedSnapshot,
+  Notification,
+  SessionMessage,
+  WorkflowRuntimeSignal,
+} from '@/types'
 
 const GATEWAY_MESSAGE_EVENTS = new Set([
   'message',
@@ -34,10 +48,6 @@ interface HealthResponse {
   }
 }
 
-interface UnreadCountResponse {
-  unreadCount: number
-}
-
 function coerceTimestamp(value: unknown): string {
   if (typeof value === 'string') return value
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -47,162 +57,17 @@ function coerceTimestamp(value: unknown): string {
   return new Date().toISOString()
 }
 
-function parseAgentSessionKey(value: string): { agentId?: string; sessionId?: string } {
-  if (value.startsWith('agent:')) {
-    const parts = value.split(':')
-    if (parts.length >= 3) {
-      return {
-        agentId: parts[1],
-        sessionId: parts.slice(2).join(':'),
-      }
-    }
-  }
-
-  if (value.startsWith('agent/')) {
-    const parts = value.split('/')
-    if (parts.length >= 3) {
-      return {
-        agentId: parts[1],
-        sessionId: parts.slice(2).join('/'),
-      }
-    }
-  }
-
-  return {}
-}
-
-function coerceContent(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => {
-        if (typeof item === 'string') return item
-        if (item && typeof item === 'object') {
-          const text = (item as Record<string, unknown>).text ?? (item as Record<string, unknown>).content
-          return typeof text === 'string' ? text : ''
-        }
-        return ''
-      })
-      .filter(Boolean)
-      .join('\n')
-  }
-  if (value && typeof value === 'object') {
-    const record = value as Record<string, unknown>
-    if (typeof record.text === 'string') return record.text
-    if (typeof record.content === 'string') return record.content
-  }
-  return ''
-}
-
-function normalizeRealtimeMessage(payload: unknown): SessionMessage | null {
-  if (!payload || typeof payload !== 'object') return null
-  const record = payload as Record<string, unknown>
-  const envelope =
-    record.message && typeof record.message === 'object'
-      ? (record.message as Record<string, unknown>)
-      : record
-
-  const directRole = envelope.role ?? record.role
-  const role =
-    directRole === 'user' || directRole === 'assistant' || directRole === 'system'
-      ? directRole
-      : ((envelope.authorRole ??
-          record.authorRole ??
-          envelope.senderRole ??
-          record.senderRole ??
-          'assistant') as SessionMessage['role'])
-
-  const nestedSession =
-    envelope.session && typeof envelope.session === 'object'
-      ? (envelope.session as Record<string, unknown>)
-      : record.session && typeof record.session === 'object'
-        ? (record.session as Record<string, unknown>)
-        : null
-
-  const sessionKey =
-    typeof envelope.sessionKey === 'string'
-      ? envelope.sessionKey
-      : typeof record.sessionKey === 'string'
-        ? record.sessionKey
-        : typeof envelope.scope === 'string'
-          ? envelope.scope
-          : typeof record.scope === 'string'
-            ? record.scope
-            : typeof nestedSession?.key === 'string'
-              ? nestedSession.key
-              : typeof nestedSession?.id === 'string'
-                ? nestedSession.id
-                : ''
-
-  let sessionId =
-    typeof envelope.sessionId === 'string'
-      ? envelope.sessionId
-      : typeof record.sessionId === 'string'
-        ? record.sessionId
-        : typeof nestedSession?.id === 'string'
-          ? nestedSession.id
-          : ''
-  let agentId =
-    typeof envelope.agentId === 'string'
-      ? envelope.agentId
-      : typeof record.agentId === 'string'
-        ? record.agentId
-        : typeof nestedSession?.agentId === 'string'
-          ? nestedSession.agentId
-          : typeof envelope.agent === 'string'
-            ? envelope.agent
-            : typeof record.agent === 'string'
-              ? record.agent
-              : ''
-
-  const parsedFromSessionKey = sessionKey ? parseAgentSessionKey(sessionKey) : {}
-  if (!agentId && parsedFromSessionKey.agentId) {
-    agentId = parsedFromSessionKey.agentId
-  }
-  if (!sessionId && parsedFromSessionKey.sessionId) {
-    sessionId = parsedFromSessionKey.sessionId
-  }
-
-  const content = coerceContent(
-    envelope.content ??
-      record.content ??
-      envelope.text ??
-      record.text ??
-      envelope.message ??
-      record.message ??
-      envelope.parts ??
-      record.parts ??
-      ''
-  )
-  if (!content) return null
-
-  return {
-    id:
-      (typeof envelope.id === 'string' && envelope.id) ||
-      (typeof record.id === 'string' && record.id) ||
-      (typeof envelope.messageId === 'string' && envelope.messageId) ||
-      (typeof record.messageId === 'string' && record.messageId) ||
-      `rt-${agentId || 'unknown'}-${sessionId || 'main'}-${String(record.timestamp ?? Date.now())}`,
-    sessionId: sessionId || 'main',
-    sessionKey: sessionKey || undefined,
-    agentId,
-    role,
-    content,
-    timestamp: coerceTimestamp(
-      envelope.timestamp ??
-        record.timestamp ??
-        envelope.createdAt ??
-        record.createdAt ??
-        envelope.updatedAt ??
-        record.updatedAt
-    ),
-  }
-}
-
 export function useWebSocket() {
   const shownApprovalReminderKeysRef = useRef(new Set<string>())
+  const seenSnapshotNotificationIdsRef = useRef(new Set<string>())
+  const hasMonitorSnapshotRef = useRef(false)
+  const [pageVisible, setPageVisible] = useState(
+    () => (typeof document !== 'undefined' ? document.visibilityState !== 'hidden' : true),
+  )
+  const connected = useMonitorStore((state) => state.connected)
   const {
     setConnected,
+    setConnectionReady,
     setGatewayConnected,
     setGatewayRuntime,
     setGatewayLastError,
@@ -216,29 +81,140 @@ export function useWebSocket() {
     syncActiveWorkflowSignals,
     syncScheduledWorkflows,
     syncNotifications,
-    setUnreadCount,
   } = useMonitorStore()
   const updateAgentStatus = useAgentStore((state) => state.updateAgentStatus)
 
-  const applyAgentStatus = (agentId: string, status: AgentStatus, timestamp?: string) => {
+  const applyAgentStatus = useCallback((agentId: string, status: AgentStatus, timestamp?: string) => {
     setAgentStatus({ agentId, status, timestamp })
     updateAgentStatus(agentId, status)
-  }
+  }, [setAgentStatus, updateAgentStatus])
 
   const applyHealthSnapshot = useCallback((health: HealthResponse) => {
+    hasMonitorSnapshotRef.current = true
+    setConnectionReady(true)
     setGatewayConnected(resolveGatewayConnectedFromHealth(health))
     setGatewayLastError(health.gateway?.error ?? null)
     const nextRuntime = gatewayRuntimeFromHealth(health.gatewayRuntime ?? null)
     setGatewayRuntime(nextRuntime)
-  }, [setGatewayConnected, setGatewayLastError, setGatewayRuntime])
+  }, [setConnectionReady, setGatewayConnected, setGatewayLastError, setGatewayRuntime])
+
+  const buildApprovalAction = useCallback((workflowUrl: string) => {
+    return createElement(
+      ToastAction,
+      {
+        altText: '前往审批',
+        onClick: () => window.location.assign(workflowUrl),
+      },
+      '去审批',
+    ) as unknown as ToastActionElement
+  }, [])
+
+  const surfaceWorkflowSignalReminder = useCallback((signal: WorkflowRuntimeSignal) => {
+    const reminderKey = getApprovalReminderKey(signal)
+    if (signal.status !== 'waiting_approval' || signal.approvalMode !== 'human') {
+      shownApprovalReminderKeysRef.current.delete(reminderKey)
+      return
+    }
+
+    if (shownApprovalReminderKeysRef.current.has(reminderKey)) {
+      return
+    }
+
+    const reminder = buildHumanApprovalReminder(signal)
+    if (!reminder) {
+      return
+    }
+
+    shownApprovalReminderKeysRef.current.add(reminderKey)
+    toast({
+      title: reminder.title,
+      description: reminder.description,
+      action: buildApprovalAction(reminder.workflowUrl),
+    })
+  }, [buildApprovalAction])
+
+  const surfaceApprovalReminderSignals = useCallback((signals: Iterable<WorkflowRuntimeSignal>) => {
+    const { reminders, nextShownKeys } = collectHumanApprovalReminderSurfaces(
+      signals,
+      shownApprovalReminderKeysRef.current,
+    )
+    shownApprovalReminderKeysRef.current = nextShownKeys
+
+    reminders.forEach(({ reminder }) => {
+      toast({
+        title: reminder.title,
+        description: reminder.description,
+        action: buildApprovalAction(reminder.workflowUrl),
+      })
+    })
+  }, [buildApprovalAction])
+
+  const maybeNotifyDesktop = useCallback((notification: Notification) => {
+    if (
+      typeof document === 'undefined' ||
+      document.visibilityState !== 'hidden' ||
+      !('Notification' in window) ||
+      Notification.permission !== 'granted'
+    ) {
+      return
+    }
+
+    new Notification(notification.title, {
+      body: notification.message,
+      icon: '/favicon.ico',
+      tag: notification.id,
+    })
+  }, [])
+
+  const surfaceSnapshotNotifications = useCallback((notifications: Notification[]) => {
+    const { notifications: surfaced, nextSeenIds } = collectRecentUnreadSnapshotNotifications(
+      notifications,
+      seenSnapshotNotificationIdsRef.current,
+    )
+    seenSnapshotNotificationIdsRef.current = nextSeenIds
+
+    surfaced.forEach((notification) => {
+      toast({
+        title: notification.title,
+        description: notification.message,
+        variant: notification.type === 'workflow_error' ? 'destructive' : undefined,
+      })
+      maybeNotifyDesktop(notification)
+    })
+  }, [maybeNotifyDesktop])
 
   const applyLiveFeedSnapshot = useCallback((snapshot: LiveFeedSnapshot) => {
+    hasMonitorSnapshotRef.current = true
+    setConnectionReady(true)
     syncEvents(snapshot.events ?? [])
     syncRealtimeMessages(snapshot.messages ?? [])
     syncActiveWorkflowSignals(snapshot.workflowSignals ?? [])
     syncScheduledWorkflows(snapshot.scheduledWorkflows ?? [])
     syncNotifications(snapshot.notifications ?? [], snapshot.unreadCount ?? 0)
-  }, [syncActiveWorkflowSignals, syncEvents, syncNotifications, syncRealtimeMessages, syncScheduledWorkflows])
+    surfaceApprovalReminderSignals(snapshot.workflowSignals ?? [])
+    surfaceSnapshotNotifications(snapshot.notifications ?? [])
+  }, [
+    surfaceApprovalReminderSignals,
+    surfaceSnapshotNotifications,
+    syncActiveWorkflowSignals,
+    syncEvents,
+    syncNotifications,
+    syncRealtimeMessages,
+    syncScheduledWorkflows,
+  ])
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return
+    }
+    const handleVisibilityChange = () => {
+      setPageVisible(document.visibilityState !== 'hidden')
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [])
 
   useEffect(() => {
     const handleGatewayRealtimeEvent = (raw: unknown) => {
@@ -266,7 +242,7 @@ export function useWebSocket() {
         const eventData = data as Record<string, unknown>
         const status = eventData.status as AgentStatus | undefined
         const explicitAgent = eventData.agentId as string | undefined
-        const parsed = typeof eventData.sessionKey === 'string' ? parseAgentSessionKey(eventData.sessionKey) : {}
+        const parsed = typeof eventData.sessionKey === 'string' ? parseRealtimeSessionKey(eventData.sessionKey) : {}
         const agentId = explicitAgent || parsed.agentId
         if (agentId && typeof status === 'string') {
           const timestamp = coerceTimestamp(eventData.timestamp ?? record.timestamp)
@@ -275,9 +251,12 @@ export function useWebSocket() {
       }
     }
 
-    const unsubConnection = wsClient.onConnectionChange((connected) => {
-      setConnected(connected)
-      if (!connected) {
+    const unsubConnection = wsClient.onConnectionChange((isConnected) => {
+      setConnected(isConnected)
+      if (!isConnected) {
+        if (hasMonitorSnapshotRef.current) {
+          setConnectionReady(true)
+        }
         setGatewayConnected(false)
         return
       }
@@ -348,50 +327,17 @@ export function useWebSocket() {
         updatedAt: signal.updatedAt ?? new Date().toISOString(),
       }
       setWorkflowSignal(nextSignal)
-
-      const reminderKey = getApprovalReminderKey(nextSignal)
-      if (nextSignal.status !== 'waiting_approval') {
-        shownApprovalReminderKeysRef.current.delete(reminderKey)
-        return
-      }
-
-      const reminder = buildHumanApprovalReminder(nextSignal)
-      if (!reminder || shownApprovalReminderKeysRef.current.has(reminderKey)) {
-        return
-      }
-
-      shownApprovalReminderKeysRef.current.add(reminderKey)
-      const action = createElement(
-        ToastAction,
-        {
-          altText: '前往审批',
-          onClick: () => window.location.assign(reminder.workflowUrl),
-        },
-        '去审批',
-      ) as unknown as ToastActionElement
-
-      toast({
-        title: reminder.title,
-        description: reminder.description,
-        action,
-      })
+      surfaceWorkflowSignalReminder(nextSignal)
     })
 
     const unsubNotification = wsClient.on('notification', (data) => {
       const notification = data as Notification
       addNotification(notification)
-
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification(notification.title, {
-          body: notification.message,
-          icon: '/favicon.ico',
-          tag: notification.id,
-        })
-      }
+      surfaceSnapshotNotifications([notification])
     })
 
     const unsubApproval = wsClient.on('approval_update', (data) => {
-      const approval = data as any
+      const approval = data as ApprovalUpdatePayload
       const reminderKey = approval?.id || `${approval?.executionId || 'unknown'}:${approval?.nodeId || '__approval__'}`
       shownApprovalReminderKeysRef.current.delete(reminderKey)
       if (approval.status === 'approved' || approval.status === 'rejected') {
@@ -401,7 +347,7 @@ export function useWebSocket() {
           title: approval.status === 'approved' ? '审批已通过' : '审批已驳回',
           message: approval.rejectReason || (approval.status === 'approved' ? '工作流将继续执行' : '工作流已终止'),
           executionId: approval.executionId,
-          nodeId: approval.nodeId,
+          nodeId: approval.nodeId ?? undefined,
           read: false,
           createdAt: new Date().toISOString(),
         })
@@ -410,6 +356,8 @@ export function useWebSocket() {
 
     return () => {
       shownApprovalReminderKeysRef.current.clear()
+      seenSnapshotNotificationIdsRef.current.clear()
+      hasMonitorSnapshotRef.current = false
       unsubStatus()
       unsubComm()
       unsubMessage()
@@ -426,81 +374,109 @@ export function useWebSocket() {
       unsubConnection()
     }
   }, [
-    setConnected,
-    setGatewayConnected,
-    setGatewayRuntime,
-    setGatewayLastError,
-    setAgentStatus,
-    updateAgentStatus,
     addEvent,
     addNotification,
     addRealtimeMessage,
-    setWorkflowSignal,
+    applyAgentStatus,
     applyHealthSnapshot,
+    applyLiveFeedSnapshot,
+    setConnected,
+    setConnectionReady,
+    setGatewayConnected,
+    setGatewayLastError,
+    setGatewayRuntime,
+    setWorkflowSignal,
+    surfaceSnapshotNotifications,
+    surfaceWorkflowSignalReminder,
   ])
 
   useEffect(() => {
     let disposed = false
 
-    const syncHealth = async () => {
-      try {
-        const health = await api.get<HealthResponse>('/health')
-        if (disposed) return
-        applyHealthSnapshot(health)
-      } catch {
-        if (disposed) return
-      }
-    }
+    const createPoller = (
+      kind: 'health' | 'statuses' | 'liveFeed',
+      task: () => Promise<void>,
+    ) => {
+      let timer: number | null = null
+      let inFlight = false
+      let consecutiveFailures = 0
 
-    const syncStatuses = async () => {
-      try {
-        const statuses = await api.get<Record<string, AgentStatus>>('/monitor/statuses')
-        if (disposed) return
-        const timestamp = new Date().toISOString()
-        Object.entries(statuses || {}).forEach(([agentId, status]) => {
-          applyAgentStatus(agentId, status, timestamp)
+      const schedule = () => {
+        if (disposed) {
+          return
+        }
+        const delay = resolveMonitorPollInterval({
+          kind,
+          visible: pageVisible,
+          connected,
+          consecutiveFailures,
         })
-      } catch {
-        // Ignore polling failures; websocket remains the primary source.
+        timer = window.setTimeout(() => {
+          void run()
+        }, delay)
+      }
+
+      const run = async () => {
+        if (disposed || inFlight) {
+          schedule()
+          return
+        }
+
+        inFlight = true
+        try {
+          await task()
+          consecutiveFailures = 0
+        } catch {
+          if (!disposed) {
+            consecutiveFailures += 1
+          }
+        } finally {
+          inFlight = false
+          schedule()
+        }
+      }
+
+      void run()
+
+      return () => {
+        if (timer !== null) {
+          window.clearTimeout(timer)
+        }
       }
     }
 
-    const syncLiveFeedSnapshot = async () => {
-      try {
-        const snapshot = await api.get<LiveFeedSnapshot>('/monitor/live-feed-snapshot?limit=50')
-        if (disposed) return
-        applyLiveFeedSnapshot(snapshot)
-      } catch {
-        // Ignore polling failures; websocket remains the primary source.
+    const stopHealth = createPoller('health', async () => {
+      const health = await api.get<HealthResponse>('/health')
+      if (disposed) {
+        return
       }
-    }
+      applyHealthSnapshot(health)
+    })
 
-    void syncHealth()
-    void syncStatuses()
-    void syncLiveFeedSnapshot()
-    const healthTimer = window.setInterval(() => {
-      void syncHealth()
-    }, 10000)
-    const timer = window.setInterval(() => {
-      void syncStatuses()
-    }, 5000)
-    const liveFeedTimer = window.setInterval(() => {
-      void syncLiveFeedSnapshot()
-    }, 5000)
+    const stopStatuses = createPoller('statuses', async () => {
+      const statuses = await api.get<Record<string, AgentStatus>>('/monitor/statuses')
+      if (disposed) {
+        return
+      }
+      const timestamp = new Date().toISOString()
+      Object.entries(statuses || {}).forEach(([agentId, status]) => {
+        applyAgentStatus(agentId, status, timestamp)
+      })
+    })
+
+    const stopLiveFeed = createPoller('liveFeed', async () => {
+      const snapshot = await api.get<LiveFeedSnapshot>('/monitor/live-feed-snapshot?limit=50')
+      if (disposed) {
+        return
+      }
+      applyLiveFeedSnapshot(snapshot)
+    })
 
     return () => {
       disposed = true
-      window.clearInterval(healthTimer)
-      window.clearInterval(timer)
-      window.clearInterval(liveFeedTimer)
+      stopHealth()
+      stopStatuses()
+      stopLiveFeed()
     }
-  }, [
-    setAgentStatus,
-    setGatewayConnected,
-    setGatewayLastError,
-    setGatewayRuntime,
-    updateAgentStatus,
-    applyHealthSnapshot,
-    applyLiveFeedSnapshot,
-  ])
+  }, [applyAgentStatus, applyHealthSnapshot, applyLiveFeedSnapshot, connected, pageVisible])
 }

@@ -112,6 +112,27 @@ class GatewayConnector:
             }
         )
 
+    def _emit_gateway_error_event(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        auth_required: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "message": message,
+            "error": message,
+            "timestamp": _now(),
+        }
+        if code:
+            payload["code"] = code
+        if auth_required:
+            payload["authRequired"] = True
+        if extra:
+            payload.update(extra)
+        self._dispatch_event("gateway.error", payload)
+
     def _next_request_id(self) -> str:
         return str(uuid.uuid4())
 
@@ -213,6 +234,11 @@ class GatewayConnector:
                     "Gateway authentication error: %s; retrying in 60s",
                     exc,
                 )
+                self._emit_gateway_error_event(
+                    f"Auth failed: {exc}",
+                    code="auth_failed",
+                    auth_required=True,
+                )
                 self._broadcast_gateway_status(
                     connected=False,
                     error=f"Auth failed: {exc}",
@@ -227,6 +253,11 @@ class GatewayConnector:
                     "Gateway connection lost: %s; reconnecting in %.0fs",
                     exc,
                     self._reconnect_delay,
+                )
+                self._emit_gateway_error_event(
+                    str(exc),
+                    code="connection_lost",
+                    auth_required=False,
                 )
                 self._broadcast_gateway_status(connected=False, error=str(exc))
                 await asyncio.sleep(self._reconnect_delay)

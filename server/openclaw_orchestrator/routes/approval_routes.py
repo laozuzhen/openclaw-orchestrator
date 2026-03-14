@@ -1,7 +1,8 @@
 """Approval API routes.
 
 Endpoints for managing workflow approval nodes:
-- Approve / reject an approval
+- Approve an approval
+- Reject an approval and retry the upstream task with appended feedback
 - List approvals (with optional execution_id filter)
 - List pending approvals
 """
@@ -47,7 +48,7 @@ async def approve(approval_id: str):
 
 @router.post("/{approval_id}/reject")
 async def reject(approval_id: str, body: RejectRequest):
-    """Reject a pending approval and stop the workflow."""
+    """Reject a pending approval and retry the upstream task with feedback."""
     try:
         return await workflow_engine.resolve_approval(
             approval_id,

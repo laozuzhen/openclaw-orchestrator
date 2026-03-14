@@ -24,7 +24,13 @@ import {
 } from '@/components/empire-dashboard/model'
 import { useAgents } from '@/hooks/use-agents'
 import { useTeams } from '@/hooks/use-teams'
-import { getActiveWorkflowCount, getActiveWorkflowSignals, getSchedulableWorkflows } from '@/lib/active-workflows'
+import {
+  getActiveWorkflowCount,
+  getActiveWorkflowSignals,
+  getSchedulableWorkflows,
+  resolveWorkflowIdForSignal,
+} from '@/lib/active-workflows'
+import { resolveGatewayDisplayState } from '@/lib/gateway-status'
 import { cn } from '@/lib/utils'
 import { useMonitorStore } from '@/stores/monitor-store'
 import type { CommunicationEvent, TeamListItem, WorkflowDefinition, WorkflowRuntimeSignal } from '@/types'
@@ -35,6 +41,7 @@ export function DashboardPage() {
   const { teams, fetchTeams } = useTeams()
   const {
     connected,
+    connectionReady,
     events,
     agentStatuses,
     gatewayConnected,
@@ -58,6 +65,12 @@ export function DashboardPage() {
     [workflowSignals],
   )
   const gatewayRuntimeRunning = gatewayRuntime?.running === true
+  const gatewayDisplayState = resolveGatewayDisplayState({
+    realtimeConnected: connected,
+    connectionReady,
+    gatewayRpcConnected: gatewayConnected,
+    gatewayRuntimeRunning,
+  })
 
   const resolvedAgents = resolveAgents(agents, agentStatuses, {
     events,
@@ -92,15 +105,7 @@ export function DashboardPage() {
 
   const hour = new Date().getHours()
   const greeting = hour < 12 ? '早上好' : hour < 18 ? '下午好' : '晚上好'
-  const systemSummary = connected
-    ? gatewayConnected
-      ? gatewayRuntimeRunning
-        ? '实时通道、Gateway RPC 和本机进程都正常'
-        : '实时通道与 Gateway RPC 正常，但本机 Gateway 进程未运行'
-      : gatewayRuntimeRunning
-        ? '实时通道已连接，本机 Gateway 在运行，但后端还没连上 RPC'
-        : '实时通道已连接，但 Gateway 还没就绪'
-    : '实时通道未连接，首页状态可能不完整'
+  const systemSummary = gatewayDisplayState.summary
 
   return (
     <div className="h-full overflow-auto p-8">
@@ -115,7 +120,7 @@ export function DashboardPage() {
 
         <div className="relative z-10 flex items-center justify-between gap-6">
           <div className="flex items-center gap-5">
-            <Logo size="lg" mood={connected ? 'waving' : 'worried'} animated />
+            <Logo size="lg" mood={connectionReady && connected ? 'waving' : 'worried'} animated />
             <div>
               <h1 className="text-2xl font-bold text-white/90">{greeting}，指挥官 👋</h1>
               <p className="mt-1 text-sm text-white/30">{systemSummary}</p>
@@ -124,16 +129,16 @@ export function DashboardPage() {
 
           <div className="flex flex-wrap items-center gap-6">
             <StatCard
-              icon={<Radio className={cn('h-4 w-4', connected ? 'text-cyber-cyan' : 'text-cyber-red')} />}
+              icon={<Radio className={cn('h-4 w-4', !connectionReady ? 'text-cyber-amber' : connected ? 'text-cyber-cyan' : 'text-cyber-red')} />}
               label="实时通道"
-              value={connected ? '已连' : '断开'}
-              valueColor={connected ? 'text-cyber-cyan' : 'text-cyber-red'}
+              value={!connectionReady ? '同步中' : connected ? '已连' : '断开'}
+              valueColor={!connectionReady ? 'text-cyber-amber' : connected ? 'text-cyber-cyan' : 'text-cyber-red'}
             />
             <StatCard
-              icon={<Wifi className={cn('h-4 w-4', gatewayConnected ? 'text-cyber-green' : 'text-cyber-red')} />}
+              icon={<Wifi className={cn('h-4 w-4', !connectionReady ? 'text-cyber-amber' : gatewayConnected ? 'text-cyber-green' : 'text-cyber-red')} />}
               label="Gateway RPC"
-              value={gatewayConnected ? '在线' : '离线'}
-              valueColor={gatewayConnected ? 'text-cyber-green' : 'text-cyber-red'}
+              value={!connectionReady ? '同步中' : gatewayConnected ? '在线' : '离线'}
+              valueColor={!connectionReady ? 'text-cyber-amber' : gatewayConnected ? 'text-cyber-green' : 'text-cyber-red'}
             />
             <StatCard
               icon={<ShieldCheck className={cn('h-4 w-4', gatewayRuntimeRunning ? 'text-cyber-amber' : 'text-white/25')} />}
@@ -294,19 +299,22 @@ function WorkflowStatusPanel({
             <div className="rounded-xl border border-white/6 bg-white/[0.03] px-3 py-4 text-[10px] text-white/30">当前没有运行中的工作流。</div>
           ) : (
             <div className="space-y-2">
-              {activeSignals.map((signal) => (
-                <WorkflowSignalCard
-                  key={signal.executionId}
-                  signal={signal}
-                  onClick={() => {
-                    if (signal.workflowId) {
-                      onOpenWorkflow(signal.workflowId, signal.executionId, signal.approvalId ?? undefined)
-                      return
-                    }
-                    onOpenWorkflows()
-                  }}
-                />
-              ))}
+              {activeSignals.map((signal) => {
+                const resolvedWorkflowId = resolveWorkflowIdForSignal(signal, scheduledWorkflows)
+                return (
+                  <WorkflowSignalCard
+                    key={signal.executionId}
+                    signal={signal}
+                    onClick={() => {
+                      if (resolvedWorkflowId) {
+                        onOpenWorkflow(resolvedWorkflowId, signal.executionId, signal.approvalId ?? undefined)
+                        return
+                      }
+                      onOpenWorkflows()
+                    }}
+                  />
+                )
+              })}
             </div>
           )}
         </div>

@@ -17,8 +17,14 @@ class SendMessageRequest(BaseModel):
 
 
 @router.get("/agents/{agent_id}/sessions")
-async def list_sessions(agent_id: str):
-    return await chat_service.list_sessions(agent_id)
+async def list_sessions(
+    agent_id: str,
+    includeWorkflowSessions: bool = False,
+):
+    return await chat_service.list_sessions(
+        agent_id,
+        include_workflow_sessions=includeWorkflowSessions,
+    )
 
 
 @router.get("/agents/{agent_id}/sessions/{session_id}/messages")

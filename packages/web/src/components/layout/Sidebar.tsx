@@ -20,6 +20,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { toast } from '@/hooks/use-toast'
 import { api } from '@/lib/api'
 import { getGatewayRuntimeActions } from '@/lib/gateway-runtime-controls'
+import { resolveGatewayDisplayState } from '@/lib/gateway-status'
 import { cn } from '@/lib/utils'
 import { useMonitorStore } from '@/stores/monitor-store'
 import type { GatewayRuntimeStatus } from '@/types'
@@ -41,21 +42,23 @@ interface SidebarProps {
 
 export function Sidebar({ expanded: expandedProp, onExpandedChange }: SidebarProps) {
   const [internalExpanded, setInternalExpanded] = useState(false)
-  const [gatewayRuntime, setGatewayRuntime] = useState<GatewayRuntimeStatus | null>(null)
   const [runtimeBusy, setRuntimeBusy] = useState(false)
   const [runtimeActionError, setRuntimeActionError] = useState<string | null>(null)
   const expanded = expandedProp ?? internalExpanded
   const setExpanded = onExpandedChange ?? setInternalExpanded
-  const { connected, gatewayConnected } = useMonitorStore()
+  const { connected, connectionReady, gatewayConnected, gatewayRuntime, gatewayLastError, setGatewayRuntime } = useMonitorStore()
 
   const loadGatewayRuntime = useCallback(async () => {
     try {
       const status = await api.get<GatewayRuntimeStatus>('/runtime/gateway')
       setGatewayRuntime(status)
+      setRuntimeActionError(null)
     } catch (error) {
       console.error('Failed to load gateway runtime status', error)
+      setGatewayRuntime(null)
+      setRuntimeActionError(error instanceof Error ? error.message : '读取 Gateway 状态失败')
     }
-  }, [])
+  }, [setGatewayRuntime])
 
   useEffect(() => {
     void loadGatewayRuntime()
@@ -70,6 +73,12 @@ export function Sidebar({ expanded: expandedProp, onExpandedChange }: SidebarPro
 
   const runGatewayAction = useCallback(
     async (action: 'start' | 'stop' | 'restart') => {
+      const actionState = getGatewayRuntimeActions(gatewayRuntime, runtimeBusy).find((item) => item.action === action)
+      if (!actionState || !actionState.visible || actionState.disabled) {
+        setRuntimeActionError(`当前状态下无法执行“${actionState?.label ?? action}”操作，请先刷新状态。`)
+        return
+      }
+
       setRuntimeBusy(true)
       try {
         const result = await api.post<GatewayRuntimeStatus>(`/runtime/gateway/${action}`)
@@ -93,17 +102,22 @@ export function Sidebar({ expanded: expandedProp, onExpandedChange }: SidebarPro
         void loadGatewayRuntime()
       }
     },
-    [loadGatewayRuntime],
+    [gatewayRuntime, loadGatewayRuntime, runtimeBusy],
   )
 
   const realtimeOk = connected
   const gatewayRpcOk = gatewayConnected
-  const localProcessOk = gatewayRuntime?.running ?? false
+  const gatewayDisplayState = resolveGatewayDisplayState({
+    realtimeConnected: realtimeOk,
+    connectionReady,
+    gatewayRpcConnected: gatewayRpcOk,
+    gatewayRuntimeRunning: gatewayRuntime?.running === true,
+  })
+  const localProcessOk = gatewayDisplayState.localProcessOk
   const runtimeActions = getGatewayRuntimeActions(gatewayRuntime, runtimeBusy)
-  const allHealthy = realtimeOk && gatewayRpcOk && localProcessOk
-  const overallTone: 'green' | 'amber' | 'red' = !realtimeOk ? 'red' : allHealthy ? 'green' : 'amber'
-  const overallLabel =
-    overallTone === 'green' ? '系统状态正常' : overallTone === 'red' ? '实时通道断开' : '部分服务未就绪'
+  const runtimeErrorMessage = runtimeActionError ?? gatewayLastError
+  const overallTone = gatewayDisplayState.tone
+  const overallLabel = gatewayDisplayState.label
 
   return (
     <aside
@@ -114,6 +128,7 @@ export function Sidebar({ expanded: expandedProp, onExpandedChange }: SidebarPro
         onMouseEnter={() => setExpanded(true)}
         onMouseLeave={() => setExpanded(false)}
       >
+        <TooltipProvider delayDuration={150}>
         <div className="mb-6 flex items-center px-4">
           <div className="flex-shrink-0">
             <Logo size="md" showText={expanded} mood={connected ? 'happy' : 'worried'} animated />
@@ -230,9 +245,9 @@ export function Sidebar({ expanded: expandedProp, onExpandedChange }: SidebarPro
               </div>
 
               {gatewayRuntime?.message ? <p className="mt-2 text-white/35">{gatewayRuntime.message}</p> : null}
-              {runtimeActionError ? (
+              {runtimeErrorMessage ? (
                 <div className="mt-2 whitespace-pre-wrap rounded-lg border border-cyber-red/20 bg-cyber-red/8 px-2.5 py-2 text-[10px] leading-5 text-cyber-red/90">
-                  {runtimeActionError}
+                  {runtimeErrorMessage}
                 </div>
               ) : null}
               {gatewayRuntime?.logTail ? (
@@ -284,6 +299,7 @@ export function Sidebar({ expanded: expandedProp, onExpandedChange }: SidebarPro
 
           {expanded ? <div className="animate-fade-in py-1 text-center text-[9px] text-white/10">v0.1.0</div> : null}
         </div>
+        </TooltipProvider>
       </aside>
   )
 }
@@ -309,7 +325,6 @@ function OverallStatus({
     tone === 'green' ? 'bg-cyber-green' : tone === 'amber' ? 'bg-cyber-amber' : 'bg-cyber-red'
 
   return (
-    <TooltipProvider delayDuration={150}>
       <Tooltip>
         <TooltipTrigger asChild>
           <button
@@ -355,7 +370,6 @@ function OverallStatus({
           </div>
         </TooltipContent>
       </Tooltip>
-    </TooltipProvider>
   )
 }
 
@@ -382,3 +396,4 @@ function ActionButton({
     </button>
   )
 }
+

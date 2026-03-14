@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -13,13 +14,19 @@ from typing import Any
 from urllib.parse import urlparse
 
 from openclaw_orchestrator.config import settings
+from openclaw_orchestrator.services.gateway_connector import (
+    DEFAULT_OPERATOR_ROLE,
+    DEFAULT_OPERATOR_SCOPES,
+    GATEWAY_CLIENT_ID,
+    GATEWAY_CLIENT_MODE,
+    PROTOCOL_VERSION,
+)
 
 _WINDOWS_CREATE_NO_WINDOW = 0x08000000
 _WINDOWS_DETACHED_PROCESS = 0x00000008
 _LOCAL_GATEWAY_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 _DEFAULT_RUNTIME_GATEWAY_HOST = "127.0.0.1"
 _DEFAULT_GATEWAY_PORT = 18789
-_RUNTIME_GATEWAY_PROTOCOL_VERSION = 3
 _DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost",
     "http://127.0.0.1",
@@ -494,24 +501,20 @@ class RuntimeService:
 
     def _gateway_connect_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "minProtocol": _RUNTIME_GATEWAY_PROTOCOL_VERSION,
-            "maxProtocol": _RUNTIME_GATEWAY_PROTOCOL_VERSION,
+            "minProtocol": PROTOCOL_VERSION,
+            "maxProtocol": PROTOCOL_VERSION,
             "client": {
-                "id": "openclaw-orchestrator-runtime",
-                "displayName": "openclaw-orchestrator-runtime",
+                "id": GATEWAY_CLIENT_ID,
+                "displayName": "openclaw-orchestrator",
                 "version": "1.0.0",
-                "platform": f"python/{os.name}",
-                "mode": "backend",
+                "platform": f"python/{platform.system().lower()}",
+                "mode": GATEWAY_CLIENT_MODE,
                 "instanceId": self._gateway_request_id(),
             },
             "caps": [],
-            "role": "operator",
-            "scopes": [
-                "operator.admin",
-                "operator.approvals",
-                "operator.pairing",
-            ],
-            "userAgent": "openclaw-orchestrator-runtime",
+            "role": DEFAULT_OPERATOR_ROLE,
+            "scopes": list(DEFAULT_OPERATOR_SCOPES),
+            "userAgent": "openclaw-orchestrator",
             "locale": "zh-CN",
         }
         auth_token = self._resolve_gateway_auth_token()
@@ -802,7 +805,7 @@ class RuntimeService:
             "cwd": str(self._openclaw_home),
         }
         if os.name == "nt":
-            kwargs["creationflags"] = _WINDOWS_CREATE_NO_WINDOW | _WINDOWS_DETACHED_PROCESS
+            kwargs["creationflags"] = _WINDOWS_CREATE_NO_WINDOW
         else:
             kwargs["start_new_session"] = True
         subprocess.Popen(command, **kwargs)
@@ -870,7 +873,12 @@ class RuntimeService:
                     path_entries.insert(0, entry)
 
         env["PATH"] = os.pathsep.join(path_entries)
-        env["OPENCLAW_HOME"] = str(self._openclaw_home)
+
+        default_openclaw_home = Path.home() / ".openclaw"
+        if self._openclaw_home == default_openclaw_home:
+            env.pop("OPENCLAW_HOME", None)
+        else:
+            env["OPENCLAW_HOME"] = str(self._openclaw_home)
         return env
 
 

@@ -9,6 +9,7 @@ import {
 } from 'reactflow'
 import { api } from '@/lib/api'
 import { toast } from '@/hooks/use-toast'
+import { createDefaultWorkflowNodeData } from '@/pages/workflow-editor/node-defaults'
 import type {
   AgentListItem,
   WorkflowDefinition,
@@ -258,21 +259,13 @@ export function useWorkflowEditor() {
 
   const addNode = (type: WorkflowNodeData['type']) => {
     const nodeId = `${type}-${Date.now()}`
-    const baseData: Record<WorkflowNodeData['type'], WorkflowNodeData> = {
-      task: { type: 'task', label: '任务节点', agentId: '', task: '', timeoutSeconds: 60, position: { x: 240, y: 120 } },
-      condition: { type: 'condition', label: '条件节点', expression: 'true', branches: { yes: '', no: '' }, position: { x: 240, y: 120 } },
-      approval: { type: 'approval', label: '审批节点', title: '请确认', description: '', approver: 'web-user', timeoutMinutes: 30, onTimeout: 'reject', position: { x: 240, y: 120 } },
-      join: { type: 'join', label: '汇合节点', joinMode: 'and', waitForAll: true, position: { x: 240, y: 120 } },
-      parallel: { type: 'parallel', label: '汇合节点', joinMode: 'and', waitForAll: true, position: { x: 240, y: 120 } },
-      meeting: { type: 'meeting', label: '会议节点', meetingType: 'brainstorm', topic: '', participants: [], position: { x: 240, y: 120 } },
-      debate: { type: 'debate', label: '辩论节点', topic: '', participants: [], maxRounds: 3, position: { x: 240, y: 120 } },
-    }
+    const nodeData = createDefaultWorkflowNodeData(type)
 
     const nextNode: Node<WorkflowNodeData> = {
       id: nodeId,
       type,
       position: { x: 180 + nodes.length * 30, y: 100 + nodes.length * 20 },
-      data: baseData[type],
+      data: nodeData,
     }
 
     setNodes((cur) => [...cur, nextNode])

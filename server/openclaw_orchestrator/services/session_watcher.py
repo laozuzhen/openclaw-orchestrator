@@ -10,6 +10,7 @@ responses (``wait_for_response``).
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import os
@@ -36,6 +37,8 @@ class SessionWatcher:
 
     def __init__(self) -> None:
         self._offsets: dict[str, int] = {}
+        self._pending_bytes: dict[str, bytes] = {}
+        self._pending_lines: dict[str, str] = {}
         self._agent_statuses: dict[str, str] = {}
         self._last_activity: dict[str, float] = {}  # agent_id → unix timestamp
         self._task: Optional[asyncio.Task[None]] = None
@@ -100,17 +103,22 @@ class SessionWatcher:
         current_offset = self._offsets.get(file_path, 0)
         file_size = os.path.getsize(file_path)
 
-        if file_size <= current_offset:
+        if file_size < current_offset:
+            current_offset = 0
+            self._offsets[file_path] = 0
+            self._pending_bytes.pop(file_path, None)
+            self._pending_lines.pop(file_path, None)
+        elif file_size == current_offset:
             return
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        new_content = content[current_offset:]
-        self._offsets[file_path] = file_size
+        next_offset, new_content = self._read_appended_text(file_path, current_offset)
+        if next_offset == current_offset or not new_content:
+            self._offsets[file_path] = next_offset
+            return
+        self._offsets[file_path] = next_offset
 
         agent_id = self._extract_agent_id(file_path)
-        lines = [l for l in new_content.split("\n") if l.strip()]
+        lines = self._extract_complete_lines(file_path, new_content)
 
         for line in lines:
             parsed = self._parse_line(line, agent_id, file_path)
@@ -136,6 +144,51 @@ class SessionWatcher:
             self._check_agent_communication(parsed, agent_id)
 
             self._update_agent_status(agent_id, parsed)
+
+    def _read_appended_text(self, file_path: str, offset: int) -> tuple[int, str]:
+        try:
+            with open(file_path, "rb") as handle:
+                handle.seek(offset)
+                new_bytes = handle.read()
+        except OSError:
+            return offset, ""
+
+        if not new_bytes:
+            return offset, ""
+
+        prior_pending = self._pending_bytes.get(file_path, b"")
+        combined = prior_pending + new_bytes
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        text = decoder.decode(combined, final=False)
+        undecoded = decoder.getstate()[0]
+        next_offset = offset + len(new_bytes)
+
+        if undecoded:
+            self._pending_bytes[file_path] = undecoded
+        else:
+            self._pending_bytes.pop(file_path, None)
+
+        return next_offset, text
+
+    def _extract_complete_lines(self, file_path: str, new_content: str) -> list[str]:
+        buffered = self._pending_lines.get(file_path, "")
+        combined = buffered + new_content
+        if not combined:
+            return []
+
+        trailing_newline = combined.endswith("\n")
+        raw_lines = combined.splitlines()
+
+        if trailing_newline:
+            self._pending_lines.pop(file_path, None)
+            return [line for line in raw_lines if line.strip()]
+
+        if not raw_lines:
+            self._pending_lines[file_path] = combined
+            return []
+
+        self._pending_lines[file_path] = raw_lines[-1]
+        return [line for line in raw_lines[:-1] if line.strip()]
 
     def _parse_line(
         self, line: str, agent_id: str, file_path: str

@@ -18,6 +18,7 @@ All file paths are relative to OPENCLAW_HOME (default: ~/.openclaw).
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import os
@@ -27,16 +28,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from openclaw_orchestrator.config import settings
+from openclaw_orchestrator.services.agent_service import agent_service
 from openclaw_orchestrator.utils.time import utc_from_timestamp, utc_now, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
 TRANSIENT_SESSION_PREFIXES = (
-    "wf-",
-    "approval-",
-    "meeting-",
-    "meeting-conclude-",
-    "debate-",
     "orchestrator-",
 )
 
@@ -188,6 +185,8 @@ class OpenClawBridge:
 
         if session_id:
             candidate = session_id.strip()
+            if candidate == "main" or self.is_transient_session_id(candidate):
+                return self._main_session_key(agent_id)
             if candidate.startswith("agent:"):
                 resolved = await gateway_connector.resolve_session_key(
                     key=candidate,
@@ -195,16 +194,75 @@ class OpenClawBridge:
                 )
                 if resolved:
                     return resolved
-            resolved = await gateway_connector.resolve_session_key(
-                key=candidate,
-                session_id=candidate,
-                label=candidate,
-                agent_id=agent_id,
-            )
-            if resolved:
-                return resolved
+                return None
+            else:
+                resolved = await gateway_connector.resolve_session_key(
+                    session_id=candidate,
+                    agent_id=agent_id,
+                )
+                if resolved:
+                    return resolved
+                list_active_sessions = getattr(gateway_connector, "list_active_sessions", None)
+                if callable(list_active_sessions):
+                    sessions = await list_active_sessions(agent_id)
+                    for session in sessions:
+                        if not isinstance(session, dict):
+                            continue
+                        candidate_key = str(session.get("key") or "").strip()
+                        candidate_session_id = str(session.get("sessionId") or "").strip()
+                        if candidate_session_id == candidate:
+                            return candidate_key or None
+                        if (
+                            candidate_key.startswith(f"agent:{agent_id}:")
+                            and candidate_key.split(":", 2)[-1] == candidate
+                        ):
+                            return candidate_key
+
+                return None
 
         return self._main_session_key(agent_id)
+
+    async def _ensure_gateway_session_key(
+        self,
+        *,
+        agent_id: str,
+        session_id: str | None = None,
+        model: str | None = None,
+    ) -> str | None:
+        from openclaw_orchestrator.services.gateway_connector import gateway_connector
+
+        resolved = await self._resolve_gateway_session_key(
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        if resolved:
+            return resolved
+
+        candidate = str(session_id or "").strip()
+        if not candidate:
+            return self._main_session_key(agent_id)
+        if candidate == "main" or self.is_transient_session_id(candidate):
+            return self._main_session_key(agent_id)
+
+        session_key = (
+            candidate if candidate.startswith("agent:") else f"agent:{agent_id}:{candidate}"
+        )
+        patch_payload: dict[str, Any] = {"key": session_key}
+        if isinstance(model, str) and model.strip():
+            patch_payload["model"] = model.strip()
+
+        # OpenClaw's Gateway agent/chat flows expect a session-store entry to exist first.
+        await gateway_connector.call_rpc(
+            "sessions.patch",
+            patch_payload,
+            timeout=10.0,
+        )
+
+        resolved_after_patch = await gateway_connector.resolve_session_key(
+            key=session_key,
+            agent_id=agent_id,
+        )
+        return resolved_after_patch or session_key
 
     async def _fetch_gateway_reply(
         self,
@@ -262,6 +320,7 @@ class OpenClawBridge:
         session_id = session_id or f"orchestrator-{correlation_id}"
         cleanup_transient_session = self.is_transient_session_id(session_id)
         start_time = utc_now()
+        agent_service.ensure_runtime_agent_registered(agent_id)
 
         async def finalize(payload: dict[str, Any]) -> dict[str, Any]:
             if cleanup_transient_session:
@@ -283,21 +342,17 @@ class OpenClawBridge:
         gateway_session_key: str | None = None
         gateway_run_id: str | None = None
         gateway_used = False
-        gateway_request_label: str | None = None
+        delivery_channel: str | None = None
         assistant_count_before = 0
         try:
             from openclaw_orchestrator.services.gateway_connector import gateway_connector
             if gateway_connector.connected:
-                gateway_session_key = await self._resolve_gateway_session_key(
+                gateway_session_key = await self._ensure_gateway_session_key(
                     agent_id=agent_id,
                     session_id=session_id,
+                    model=model,
                 )
                 if gateway_session_key:
-                    if not (
-                        cleanup_transient_session
-                        and gateway_session_key == self._main_session_key(agent_id)
-                    ):
-                        gateway_request_label = session_id if session_id else None
                     history_before = await gateway_connector.get_chat_history(
                         session_key=gateway_session_key,
                         limit=1000,
@@ -315,8 +370,6 @@ class OpenClawBridge:
                         "timeout": max(0, int(timeout_seconds * 1000)),
                         "idempotencyKey": correlation_id,
                     }
-                    if gateway_request_label:
-                        params["label"] = gateway_request_label
                     agent_result = await gateway_connector.call_rpc(
                         "agent",
                         params,
@@ -326,6 +379,7 @@ class OpenClawBridge:
                         gateway_run_id = str(agent_result.get("runId") or "").strip() or None
                     if gateway_run_id:
                         gateway_used = True
+                        delivery_channel = "gateway"
                         logger.info(
                             "Gateway agent dispatch: %s/%s (%s)",
                             agent_id,
@@ -340,12 +394,36 @@ class OpenClawBridge:
         pre_offset = self._get_file_size(session_file)
 
         if not gateway_used:
-            # Gateway unavailable — try Webhook, then JSONL direct write
-            webhook_ok = await self._send_webhook(agent_id, message, session_id, correlation_id, model=model)
+            # Gateway unavailable — try Webhook only
+            webhook_ok = await self._send_webhook(
+                agent_id,
+                message,
+                session_id,
+                correlation_id,
+                model=model,
+            )
+            if webhook_ok:
+                delivery_channel = "webhook"
 
             if not webhook_ok:
-                # Fallback: write directly to JSONL (manual trigger)
-                self._write_user_message(agent_id, session_id, message, correlation_id)
+                jsonl_ok = self._write_user_message(
+                    agent_id,
+                    session_id,
+                    message,
+                    correlation_id,
+                )
+                if jsonl_ok:
+                    delivery_channel = "jsonl"
+                else:
+                    elapsed = (utc_now() - start_time).total_seconds()
+                    return await finalize({
+                        "success": False,
+                        "content": f"Gateway/Webhook/JSONL delivery failed for {agent_id}",
+                        "sessionId": session_id,
+                        "correlationId": correlation_id,
+                        "elapsed": round(elapsed, 2),
+                        "channel": "jsonl",
+                    })
 
         elapsed = (utc_now() - start_time).total_seconds()
 
@@ -361,8 +439,9 @@ class OpenClawBridge:
                     },
                     timeout=float(timeout_seconds) + 5.0,
                 )
+                elapsed = (utc_now() - start_time).total_seconds()
                 status = (
-                    str(wait_result.get("status") or "").strip()
+                    str(wait_result.get("status") or "").strip().lower()
                     if isinstance(wait_result, dict)
                     else ""
                 )
@@ -397,7 +476,35 @@ class OpenClawBridge:
                         "channel": "gateway",
                         "runId": gateway_run_id,
                     })
+                if status in {"timeout", "timed_out", "timed-out"}:
+                    return await finalize({
+                        "success": False,
+                        "content": f"Agent {agent_id} did not respond within {timeout_seconds}s",
+                        "sessionId": session_id,
+                        "sessionKey": gateway_session_key,
+                        "correlationId": correlation_id,
+                        "elapsed": round(elapsed, 2),
+                        "channel": "gateway",
+                        "runId": gateway_run_id,
+                    })
+                if status:
+                    error_message = (
+                        str(wait_result.get("error") or "").strip()
+                        if isinstance(wait_result, dict)
+                        else ""
+                    )
+                    return await finalize({
+                        "success": False,
+                        "content": error_message or f"Gateway wait returned unexpected status: {status}",
+                        "sessionId": session_id,
+                        "sessionKey": gateway_session_key,
+                        "correlationId": correlation_id,
+                        "elapsed": round(elapsed, 2),
+                        "channel": "gateway",
+                        "runId": gateway_run_id,
+                    })
             except Exception as exc:
+                elapsed = (utc_now() - start_time).total_seconds()
                 return await finalize({
                     "success": False,
                     "content": f"Gateway wait failed: {exc}",
@@ -420,7 +527,7 @@ class OpenClawBridge:
                 "sessionId": session_id,
                 "correlationId": correlation_id,
                 "elapsed": round(elapsed, 2),
-                "channel": "webhook+jsonl",
+                "channel": delivery_channel or "unknown",
             })
 
         return await finalize({
@@ -429,6 +536,7 @@ class OpenClawBridge:
             "sessionId": session_id,
             "correlationId": correlation_id,
             "elapsed": round(elapsed, 2),
+            "channel": delivery_channel or ("gateway" if gateway_used else "unknown"),
         })
 
     async def send_agent_message(
@@ -452,9 +560,10 @@ class OpenClawBridge:
         try:
             from openclaw_orchestrator.services.gateway_connector import gateway_connector
             if gateway_connector.connected:
-                session_key = await self._resolve_gateway_session_key(
+                session_key = await self._ensure_gateway_session_key(
                     agent_id=agent_id,
                     session_id=session_id,
+                    model=model,
                 )
                 if session_key:
                     await gateway_connector.send_chat(
@@ -473,17 +582,40 @@ class OpenClawBridge:
             logger.warning("Gateway chat.send failed for %s: %s", agent_id, e)
             # Fall back to Webhook
 
-        webhook_ok = await self._send_webhook(agent_id, content, session_id, correlation_id, model=model)
+        webhook_ok = await self._send_webhook(
+            agent_id,
+            content,
+            session_id,
+            correlation_id,
+            model=model,
+        )
 
         if not webhook_ok:
-            # Fallback: write directly to JSONL
-            self._write_user_message(agent_id, session_id, content, correlation_id)
+            jsonl_ok = self._write_user_message(
+                agent_id,
+                session_id,
+                content,
+                correlation_id,
+            )
+            if jsonl_ok:
+                return {
+                    "success": True,
+                    "message": "Message written to agent session transcript",
+                    "correlationId": correlation_id,
+                    "channel": "jsonl",
+                }
+            return {
+                "success": False,
+                "message": f"Gateway/Webhook/JSONL delivery failed for {agent_id}",
+                "correlationId": correlation_id,
+                "channel": "jsonl",
+            }
 
         return {
             "success": True,
             "message": "Message sent to agent",
             "correlationId": correlation_id,
-            "channel": "webhook" if webhook_ok else "file",
+            "channel": "webhook",
         }
 
     async def _send_webhook(
@@ -742,6 +874,9 @@ class OpenClawBridge:
         session_file = self._agent_session_path(agent_id, session_id)
         poll_interval = 1.0  # seconds
         elapsed = 0.0
+        read_offset = max(int(pre_offset or 0), 0)
+        pending_bytes = b""
+        pending_line = ""
 
         while elapsed < timeout_seconds:
             await asyncio.sleep(poll_interval)
@@ -751,21 +886,34 @@ class OpenClawBridge:
                 continue
 
             current_size = os.path.getsize(session_file)
-            if current_size <= pre_offset:
+            if current_size < read_offset:
+                read_offset = 0
+                pending_bytes = b""
+                pending_line = ""
+            elif current_size == read_offset:
                 continue
 
-            # Read new content
             try:
-                with open(session_file, "r", encoding="utf-8") as f:
-                    f.seek(pre_offset)
-                    new_content = f.read()
+                with open(session_file, "rb") as handle:
+                    handle.seek(read_offset)
+                    new_bytes = handle.read()
             except OSError:
                 continue
 
-            # Parse new lines looking for assistant messages
-            for line in new_content.strip().split("\n"):
-                if not line.strip():
-                    continue
+            if not new_bytes:
+                continue
+
+            new_content, pending_bytes, consumed_new_bytes = self._decode_incremental_utf8(
+                pending_bytes,
+                new_bytes,
+            )
+            if consumed_new_bytes <= 0 and not new_content:
+                continue
+            read_offset += consumed_new_bytes
+
+            lines, pending_line = self._split_complete_lines(pending_line, new_content)
+
+            for line in lines:
                 try:
                     data = json.loads(line)
                     normalized = self._normalize_transcript_message(
@@ -781,11 +929,39 @@ class OpenClawBridge:
                 except json.JSONDecodeError:
                     continue
 
-            # Gradually increase poll interval to reduce I/O
             if elapsed > 10:
                 poll_interval = min(poll_interval + 0.5, 3.0)
 
         return None
+
+    @staticmethod
+    def _decode_incremental_utf8(
+        pending_bytes: bytes,
+        new_bytes: bytes,
+    ) -> tuple[str, bytes, int]:
+        combined = pending_bytes + new_bytes
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        text = decoder.decode(combined, final=False)
+        undecoded = decoder.getstate()[0]
+        return text, undecoded, len(new_bytes)
+
+    @staticmethod
+    def _split_complete_lines(
+        pending_line: str,
+        new_content: str,
+    ) -> tuple[list[str], str]:
+        combined = pending_line + new_content
+        if not combined:
+            return [], ""
+
+        trailing_newline = combined.endswith("\n")
+        raw_lines = combined.splitlines()
+
+        if trailing_newline:
+            return [line for line in raw_lines if line.strip()], ""
+        if not raw_lines:
+            return [], combined
+        return [line for line in raw_lines[:-1] if line.strip()], raw_lines[-1]
 
     # ════════════════════════════════════════════════════════════
     # Helper methods
@@ -842,6 +1018,8 @@ class OpenClawBridge:
             self._cleanup_tasks.discard(done_task)
             try:
                 done_task.result()
+            except asyncio.CancelledError:
+                return
             except Exception as exc:
                 logger.warning(
                     "Deferred transient cleanup crashed for %s/%s: %s",
@@ -901,9 +1079,7 @@ class OpenClawBridge:
 
         for attempt in range(3):
             resolved = await gateway_connector.resolve_session_key(
-                key=session_id,
                 session_id=session_id,
-                label=session_id,
                 agent_id=agent_id,
             )
             if resolved and resolved != main_session_key:
@@ -988,7 +1164,7 @@ class OpenClawBridge:
         session_id: str,
         content: str,
         correlation_id: str,
-    ) -> None:
+    ) -> bool:
         """Write a user message directly to JSONL (fallback when webhook unavailable).
 
         This creates the session file if needed and appends a user-role message.
@@ -1018,8 +1194,10 @@ class OpenClawBridge:
             with open(session_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(message, ensure_ascii=False) + "\n")
             logger.info("Wrote user message to %s/%s.jsonl", agent_id, session_id)
+            return True
         except OSError as e:
             logger.error("Failed to write JSONL for %s: %s", agent_id, e)
+            return False
 
     async def close(self) -> None:
         """Close the HTTP client on shutdown."""

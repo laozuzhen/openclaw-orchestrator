@@ -24,6 +24,19 @@ class ChatDeliveryError(RuntimeError):
 class ChatService:
     """Service for reading agent chat sessions."""
 
+    WORKFLOW_SESSION_PREFIXES = (
+        "workflow-",
+        "wf-",
+        "approval-",
+        "meeting-",
+        "meeting-conclude-",
+        "debate-",
+    )
+
+    INTERNAL_SESSION_PREFIXES = (
+        "orchestrator-",
+    )
+
     @staticmethod
     def _normalize_timestamp(value: Any) -> str:
         if isinstance(value, (int, float)):
@@ -44,6 +57,27 @@ class ChatService:
         if len(parts) < 3:
             return ""
         return parts[2].strip()
+
+    @classmethod
+    def _gateway_session_identity(cls, session: dict[str, Any]) -> tuple[str, str]:
+        session_key = str(session.get("key") or "").strip()
+        session_id = str(session.get("sessionId") or "").strip()
+        logical_session_id = cls._session_key_suffix(session_key) or session_id
+        if not logical_session_id:
+            return "", ""
+
+        if logical_session_id == "main":
+            return "main", "main"
+
+        for candidate in (
+            session.get("displayName"),
+            session.get("label"),
+            logical_session_id,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return logical_session_id, candidate.strip()
+
+        return logical_session_id, logical_session_id
 
     @staticmethod
     def _extract_text_content(content: Any) -> str:
@@ -118,28 +152,74 @@ class ChatService:
         }
 
     @staticmethod
+    def _sort_activity_key(value: Any) -> float:
+        normalized = str(value or "").strip()
+        if not normalized:
+            return float("inf")
+        try:
+            return -datetime.fromisoformat(normalized.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return float("inf")
+
+    @staticmethod
     def _sort_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return sorted(
             sessions,
             key=lambda session: (
                 0 if str(session.get("id") or "") == "main" else 1,
-                str(session.get("lastActivity") or ""),
+                ChatService._sort_activity_key(session.get("lastActivity")),
+                str(session.get("name") or ""),
             ),
-            reverse=False,
         )
 
     @classmethod
-    def _is_internal_gateway_session(
-        cls, *, session_id: str, session_key: str | None = None
-    ) -> bool:
-        if session_id == "main":
+    def _is_internal_session_id(cls, session_id: str) -> bool:
+        normalized = str(session_id or "").strip().lower()
+        if normalized == "main":
             return False
+        return normalized.startswith(cls.INTERNAL_SESSION_PREFIXES)
+
+    @classmethod
+    def _is_workflow_session_id(cls, session_id: str) -> bool:
+        normalized = str(session_id or "").strip().lower()
+        if normalized == "main":
+            return False
+        return normalized.startswith(cls.WORKFLOW_SESSION_PREFIXES)
+
+    @classmethod
+    def _should_include_session(
+        cls,
+        session_id: str,
+        *,
+        include_workflow_sessions: bool,
+    ) -> bool:
+        if cls._is_internal_session_id(session_id):
+            return False
+        if cls._is_workflow_session_id(session_id):
+            return include_workflow_sessions
+        return True
+
+    @classmethod
+    def _is_internal_gateway_session(
+        cls,
+        *,
+        session_id: str,
+        session_key: str | None = None,
+        include_workflow_sessions: bool,
+    ) -> bool:
         suffix = cls._session_key_suffix(session_key)
-        return bool(suffix) and suffix.lower().startswith(
-            ("wf-", "approval-", "meeting-", "meeting-conclude-", "debate-", "orchestrator-")
+        effective_session_id = suffix or session_id
+        return not cls._should_include_session(
+            effective_session_id,
+            include_workflow_sessions=include_workflow_sessions,
         )
 
-    async def _list_sessions_from_gateway(self, agent_id: str) -> list[dict[str, Any]]:
+    async def _list_sessions_from_gateway(
+        self,
+        agent_id: str,
+        *,
+        include_workflow_sessions: bool,
+    ) -> list[dict[str, Any]]:
         from openclaw_orchestrator.services.gateway_connector import gateway_connector
 
         if not gateway_connector.connected:
@@ -147,19 +227,20 @@ class ChatService:
 
         sessions = await gateway_connector.list_active_sessions(agent_id)
         normalized: list[dict[str, Any]] = []
-        for index, session in enumerate(sessions):
-            session_id = str(session.get("sessionId") or "").strip()
+        for session in sessions:
+            session_id, session_name = self._gateway_session_identity(session)
             if not session_id:
                 continue
             if self._is_internal_gateway_session(
                 session_id=session_id,
                 session_key=str(session.get("key") or ""),
+                include_workflow_sessions=include_workflow_sessions,
             ):
                 continue
             normalized.append(
                 {
                     "id": session_id,
-                    "name": "main" if session_id == "main" else session_id,
+                    "name": session_name,
                     "messageCount": int(session.get("messageCount") or 0),
                     "lastActivity": self._normalize_timestamp(session.get("updatedAt")),
                 }
@@ -181,7 +262,12 @@ class ChatService:
             deduped[session["id"]] = session
         return self._sort_sessions(list(deduped.values()))
 
-    def _list_sessions_from_files(self, agent_id: str) -> list[dict[str, Any]]:
+    def _list_sessions_from_files(
+        self,
+        agent_id: str,
+        *,
+        include_workflow_sessions: bool,
+    ) -> list[dict[str, Any]]:
         """List all sessions for an agent from local JSONL files."""
         from openclaw_orchestrator.services.openclaw_bridge import OpenClawBridge
 
@@ -196,6 +282,11 @@ class ChatService:
 
         for file in files:
             session_id = file.removesuffix(".jsonl")
+            if not self._should_include_session(
+                session_id,
+                include_workflow_sessions=include_workflow_sessions,
+            ):
+                continue
             if OpenClawBridge.is_transient_session_id(session_id):
                 continue
             file_path = os.path.join(sessions_dir, file)
@@ -243,11 +334,22 @@ class ChatService:
 
         return self._sort_sessions(result)
 
-    async def list_sessions(self, agent_id: str) -> list[dict[str, Any]]:
-        gateway_sessions = await self._list_sessions_from_gateway(agent_id)
+    async def list_sessions(
+        self,
+        agent_id: str,
+        *,
+        include_workflow_sessions: bool = False,
+    ) -> list[dict[str, Any]]:
+        gateway_sessions = await self._list_sessions_from_gateway(
+            agent_id,
+            include_workflow_sessions=include_workflow_sessions,
+        )
         if gateway_sessions:
             return gateway_sessions
-        return self._list_sessions_from_files(agent_id)
+        return self._list_sessions_from_files(
+            agent_id,
+            include_workflow_sessions=include_workflow_sessions,
+        )
 
     async def _get_messages_from_gateway(
         self,

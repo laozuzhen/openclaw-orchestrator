@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { MessageSquare, Send, Loader2, Sparkles } from 'lucide-react'
 import { AgentAvatar } from '@/components/avatar/AgentAvatar'
@@ -8,6 +8,8 @@ import { useAgents } from '@/hooks/use-agents'
 import { useMonitorStore } from '@/stores/monitor-store'
 import { toast } from '@/hooks/use-toast'
 import { api } from '@/lib/api'
+import { findSelectedAgentById, resolveSelectedAgentIdFromQuery } from '@/lib/chat-selection'
+import { buildRealtimeMessageKey, mergeRealtimeMessages } from '@/lib/realtime-message'
 import { cn } from '@/lib/utils'
 import type { AgentListItem, SessionMessage } from '@/types'
 
@@ -95,10 +97,20 @@ function hasMessageContent(items: SessionMessage[], role: SessionMessage['role']
   return items.some((message) => message.role === role && message.content.trim() === normalized)
 }
 
+function buildSessionsPath(agentId: string, includeWorkflowSessions: boolean): string {
+  const params = new URLSearchParams()
+  if (includeWorkflowSessions) {
+    params.set('includeWorkflowSessions', 'true')
+  }
+  const query = params.toString()
+  return `/agents/${agentId}/sessions${query ? `?${query}` : ''}`
+}
+
 export function ChatPage() {
   const { agents, loading: agentsLoading, fetchAgents } = useAgents()
   const [searchParams] = useSearchParams()
-  const [selectedAgent, setSelectedAgent] = useState<AgentListItem | null>(null)
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [showWorkflowSessions, setShowWorkflowSessions] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
   const [selectedSession, setSelectedSession] = useState<string | null>(null)
   const [messages, setMessages] = useState<SessionMessage[]>([])
@@ -107,35 +119,26 @@ export function ChatPage() {
   const [sessionsLoading, setSessionsLoading] = useState(false)
   const [messagesLoading, setMessagesLoading] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const selectedAgent = useMemo(
+    () => findSelectedAgentById(agents, selectedAgentId),
+    [agents, selectedAgentId],
+  )
 
   useEffect(() => { fetchAgents() }, [fetchAgents])
 
   // Auto-select agent from URL query ?agent=xxx (e.g., from DeskSlot click)
   useEffect(() => {
     if (agents.length === 0) return
-    const agentParam = searchParams.get('agent')
-    if (!agentParam) return
+    const nextSelectedAgentId = resolveSelectedAgentIdFromQuery(agents, searchParams.get('agent'))
+    if (!nextSelectedAgentId || selectedAgentId === nextSelectedAgentId) return
 
-    const match = agents.find((a) => a.id === agentParam || a.name === agentParam)
-    if (!match) return
-    if (selectedAgent?.id === match.id) return
-
-    setSelectedAgent(match)
+    setSelectedAgentId(nextSelectedAgentId)
     setSelectedSession(null)
     setMessages([])
-  }, [agents, searchParams, selectedAgent])
+  }, [agents, searchParams, selectedAgentId])
 
   useEffect(() => {
-    if (!selectedAgent) return
-    const latest = agents.find((agent) => agent.id === selectedAgent.id)
-    if (!latest) return
-    if (latest !== selectedAgent) {
-      setSelectedAgent(latest)
-    }
-  }, [agents, selectedAgent])
-
-  useEffect(() => {
-    if (!selectedAgent) {
+    if (!selectedAgentId) {
       setSessions([])
       setSelectedSession(null)
       return
@@ -149,7 +152,7 @@ export function ChatPage() {
     setSessionsLoading(true)
 
     api
-      .get<Session[]>(`/agents/${selectedAgent.id}/sessions`)
+      .get<Session[]>(buildSessionsPath(selectedAgentId, showWorkflowSessions))
       .then((s) => {
         if (disposed) return
 
@@ -176,10 +179,10 @@ export function ChatPage() {
     return () => {
       disposed = true
     }
-  }, [selectedAgent])
+  }, [selectedAgentId, showWorkflowSessions])
 
   useEffect(() => {
-    if (!selectedAgent || !selectedSession) {
+    if (!selectedAgentId || !selectedSession) {
       setMessages([])
       setMessagesLoading(false)
       return
@@ -189,7 +192,7 @@ export function ChatPage() {
     setMessagesLoading(true)
 
     api
-      .get<SessionMessage[]>(`/agents/${selectedAgent.id}/sessions/${selectedSession}/messages`)
+      .get<SessionMessage[]>(`/agents/${selectedAgentId}/sessions/${selectedSession}/messages`)
       .then((nextMessages) => {
         if (!disposed) {
           setMessages(nextMessages)
@@ -209,26 +212,22 @@ export function ChatPage() {
     return () => {
       disposed = true
     }
-  }, [selectedAgent, selectedSession])
+  }, [selectedAgentId, selectedSession])
 
   // Real-time: merge new messages from WebSocket into current view
   const { realtimeMessages } = useMonitorStore()
   useEffect(() => {
-    if (!selectedAgent || !selectedSession) return
+    if (!selectedAgentId || !selectedSession) return
     const newMsgs = realtimeMessages.filter((m) => {
       const messageAgentId = resolveMessageAgentId(m)
-      if (messageAgentId && messageAgentId !== selectedAgent.id) {
+      if (messageAgentId && messageAgentId !== selectedAgentId) {
         return false
       }
       return resolveMessageSessionId(m) === selectedSession
     })
     if (newMsgs.length === 0) return
-    setMessages((prev) => {
-      const existingIds = new Set(prev.map((m) => m.id))
-      const unique = newMsgs.filter((m) => !existingIds.has(m.id))
-      return unique.length > 0 ? [...prev, ...unique] : prev
-    })
-  }, [realtimeMessages, selectedAgent, selectedSession])
+    setMessages((prev) => mergeRealtimeMessages(prev, newMsgs))
+  }, [realtimeMessages, selectedAgentId, selectedSession])
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -238,7 +237,7 @@ export function ChatPage() {
 
   const refreshSessionsForAgent = async (agentId: string, preferredSessionId?: string | null) => {
     try {
-      const nextSessions = await api.get<Session[]>(`/agents/${agentId}/sessions`)
+      const nextSessions = await api.get<Session[]>(buildSessionsPath(agentId, showWorkflowSessions))
       const normalizedSessions = sortSessions(
         nextSessions.length > 0
           ? nextSessions
@@ -261,13 +260,13 @@ export function ChatPage() {
 
   const handleSend = async () => {
     const content = input.trim()
-    if (!content || !selectedAgent || !selectedSession) return
+    if (!content || !selectedAgentId || !selectedSession) return
 
     const baselineMessageCount = messages.length
     const optimisticMessage: SessionMessage = {
       id: `pending-${Date.now()}`,
       sessionId: selectedSession,
-      agentId: selectedAgent.id,
+      agentId: selectedAgentId,
       role: 'user',
       content,
       timestamp: new Date().toISOString(),
@@ -279,12 +278,12 @@ export function ChatPage() {
 
     try {
       const result = await api.post<SendMessageResult>(
-        `/agents/${selectedAgent.id}/sessions/${selectedSession}/send`,
+        `/agents/${selectedAgentId}/sessions/${selectedSession}/send`,
         { content }
       )
 
       const actualSessionId = result.sessionKey ? (parseSessionKey(result.sessionKey).sessionId ?? selectedSession) : selectedSession
-      const resolvedSessionId = await refreshSessionsForAgent(selectedAgent.id, actualSessionId)
+      const resolvedSessionId = await refreshSessionsForAgent(selectedAgentId, actualSessionId)
 
       const pollIntervals = [150, 500, 1200, 2500, 4000]
       let latestMessages: SessionMessage[] = []
@@ -292,7 +291,7 @@ export function ChatPage() {
       for (const delay of pollIntervals) {
         await sleep(delay)
         latestMessages = await api.get<SessionMessage[]>(
-          `/agents/${selectedAgent.id}/sessions/${resolvedSessionId}/messages`
+          `/agents/${selectedAgentId}/sessions/${resolvedSessionId}/messages`
         )
         setMessages(latestMessages)
 
@@ -328,6 +327,15 @@ export function ChatPage() {
             通信频道
           </h2>
           <p className="text-white/20 text-[10px] mt-1">选择 Agent 开始对话</p>
+          <label className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-white/8 bg-white/5 px-3 py-2 text-[10px] text-white/60">
+            <span>显示工作流会话</span>
+            <input
+              type="checkbox"
+              checked={showWorkflowSessions}
+              onChange={(event) => setShowWorkflowSessions(event.target.checked)}
+              className="h-3.5 w-3.5 accent-cyber-blue"
+            />
+          </label>
         </div>
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
           {agentsLoading ? (
@@ -343,7 +351,7 @@ export function ChatPage() {
               <button
                 key={agent.id}
                 onClick={() => {
-                  setSelectedAgent(agent)
+                  setSelectedAgentId(agent.id)
                   setSelectedSession(null)
                   setMessages([])
                 }}
@@ -406,6 +414,9 @@ export function ChatPage() {
                         : 'bg-white/20'
                   )} />
                   {sessions.length > 1 ? `${sessions.length} 会话` : '主会话'}
+                  {showWorkflowSessions && (
+                    <span className="ml-2 text-cyber-blue/70">含工作流</span>
+                  )}
                   {selectedAgent.model && (
                     <span className="ml-2 px-1.5 py-0.5 rounded bg-cyber-purple/10 text-cyber-lavender/50 text-[9px] border border-cyber-purple/10">
                       {selectedAgent.model}
@@ -452,8 +463,8 @@ export function ChatPage() {
                 />
               ) : (
                 <>
-                  {messages.map((msg) => (
-                    <MessageBubble key={msg.id} message={msg} agent={selectedAgent} />
+                  {messages.map((msg, index) => (
+                    <MessageBubble key={buildRealtimeMessageKey(msg, index)} message={msg} agent={selectedAgent} />
                   ))}
                   {/* Typing indicator when sending */}
                   {sending && (

@@ -4,44 +4,11 @@ import type { OrchestratorPluginApi, OrchestratorPluginToolContext } from "./plu
 import { jsonResult, stringEnum } from "./plugin-sdk-compat.ts";
 import { createOrchestratorClient, type OrchestratorPluginConfig } from "./client.ts";
 
-const KNOWLEDGE_SCOPE_VALUES = ["agent", "team"] as const;
 const APPROVAL_ACTION_VALUES = ["approve", "reject"] as const;
 
-const KnowledgeScopeSchema = stringEnum(KNOWLEDGE_SCOPE_VALUES, {
-  description: "Knowledge scope: agent or team.",
-});
-
 const ApprovalActionSchema = stringEnum(APPROVAL_ACTION_VALUES, {
-  description: "Approval action: approve or reject.",
+  description: "Approval action: approve to continue, or reject to append feedback and retry the upstream task.",
 });
-
-const KnowledgeListParamsSchema = Type.Object(
-  {
-    scope: KnowledgeScopeSchema,
-    targetId: Type.String({ description: "Agent ID or team ID." }),
-  },
-  { additionalProperties: false },
-);
-
-const KnowledgeSearchParamsSchema = Type.Object(
-  {
-    scope: KnowledgeScopeSchema,
-    targetId: Type.String({ description: "Agent ID or team ID." }),
-    query: Type.String({ description: "Search query." }),
-  },
-  { additionalProperties: false },
-);
-
-const KnowledgeAddParamsSchema = Type.Object(
-  {
-    scope: KnowledgeScopeSchema,
-    targetId: Type.String({ description: "Agent ID or team ID." }),
-    sourceType: Type.String({ description: "Source type, for example file or url." }),
-    sourcePath: Type.String({ description: "File path or URL." }),
-    title: Type.String({ description: "Knowledge item title." }),
-  },
-  { additionalProperties: false },
-);
 
 const WorkflowPayloadSchema = Type.Object(
   {
@@ -88,20 +55,10 @@ function actorFromContext(ctx: OrchestratorPluginToolContext): string {
   return ctx.agentId || ctx.sessionKey || ctx.agentAccountId || ctx.messageChannel || "plugin";
 }
 
-function scopePath(scope: (typeof KNOWLEDGE_SCOPE_VALUES)[number], targetId: string): string {
-  return scope === "agent" ? `/agents/${targetId}/knowledge` : `/teams/${targetId}/knowledge`;
-}
-
 export const ORCHESTRATOR_TOOL_NAMES = [
   "orchestrator_status",
-  "orchestrator_gateway_status",
-  "orchestrator_start_gateway",
-  "orchestrator_stop_gateway",
-  "orchestrator_restart_gateway",
   "orchestrator_monitor_statuses",
   "orchestrator_live_feed_snapshot",
-  "orchestrator_list_agents",
-  "orchestrator_get_agent",
   "orchestrator_list_teams",
   "orchestrator_get_team",
   "orchestrator_create_team",
@@ -117,14 +74,8 @@ export const ORCHESTRATOR_TOOL_NAMES = [
   "orchestrator_get_execution",
   "orchestrator_list_pending_approvals",
   "orchestrator_resolve_approval",
-  "orchestrator_list_sessions",
-  "orchestrator_send_agent_message",
-  "orchestrator_list_knowledge",
-  "orchestrator_add_knowledge",
-  "orchestrator_search_knowledge",
 ] as const;
 
-type KnowledgeScope = (typeof KNOWLEDGE_SCOPE_VALUES)[number];
 type ApprovalAction = (typeof APPROVAL_ACTION_VALUES)[number];
 
 type WorkflowQuery = {
@@ -150,10 +101,6 @@ type WorkflowExecutionList = {
 type WorkflowStop = {
   workflowId: string;
   executionId: string;
-};
-
-type AgentGet = {
-  agentId: string;
 };
 
 type TeamGet = {
@@ -195,35 +142,6 @@ type ApprovalResolve = {
   rejectReason?: string;
 };
 
-type SessionList = {
-  agentId: string;
-};
-
-type SendMessage = {
-  agentId: string;
-  content: string;
-  sessionId?: string;
-};
-
-type KnowledgeList = {
-  scope: KnowledgeScope;
-  targetId: string;
-};
-
-type KnowledgeAdd = {
-  scope: KnowledgeScope;
-  targetId: string;
-  sourceType: string;
-  sourcePath: string;
-  title: string;
-};
-
-type KnowledgeSearch = {
-  scope: KnowledgeScope;
-  targetId: string;
-  query: string;
-};
-
 export function createOrchestratorTools(
   _api: OrchestratorPluginApi,
   config: OrchestratorPluginConfig,
@@ -260,42 +178,6 @@ export function createOrchestratorTools(
       },
     },
     {
-      name: "orchestrator_gateway_status",
-      label: "Orchestrator Gateway Status",
-      description: "Inspect orchestrator-side gateway runtime status.",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() {
-        return jsonResult(await client.get("/runtime/gateway"));
-      },
-    },
-    {
-      name: "orchestrator_start_gateway",
-      label: "Orchestrator Start Gateway",
-      description: "Ask orchestrator to start the OpenClaw gateway runtime.",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() {
-        return jsonResult(await client.post("/runtime/gateway/start"));
-      },
-    },
-    {
-      name: "orchestrator_stop_gateway",
-      label: "Orchestrator Stop Gateway",
-      description: "Ask orchestrator to stop the OpenClaw gateway runtime.",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() {
-        return jsonResult(await client.post("/runtime/gateway/stop"));
-      },
-    },
-    {
-      name: "orchestrator_restart_gateway",
-      label: "Orchestrator Restart Gateway",
-      description: "Ask orchestrator to restart the OpenClaw gateway runtime.",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() {
-        return jsonResult(await client.post("/runtime/gateway/restart"));
-      },
-    },
-    {
       name: "orchestrator_monitor_statuses",
       label: "Orchestrator Monitor Statuses",
       description: "Fetch current agent monitor statuses from orchestrator.",
@@ -311,24 +193,6 @@ export function createOrchestratorTools(
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() {
         return jsonResult(await client.get("/monitor/live-feed-snapshot"));
-      },
-    },
-    {
-      name: "orchestrator_list_agents",
-      label: "Orchestrator List Agents",
-      description: "List agents known to the orchestrator.",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() {
-        return jsonResult(await client.get("/agents"));
-      },
-    },
-    {
-      name: "orchestrator_get_agent",
-      label: "Orchestrator Get Agent",
-      description: "Get details for one agent.",
-      parameters: Type.Object({ agentId: Type.String() }, { additionalProperties: false }),
-      async execute(_toolCallId: string, params: AgentGet) {
-        return jsonResult(await client.get(`/agents/${params.agentId}`));
       },
     },
     {
@@ -503,12 +367,12 @@ export function createOrchestratorTools(
     {
       name: "orchestrator_resolve_approval",
       label: "Orchestrator Resolve Approval",
-      description: "Approve or reject a pending approval node.",
+      description: "Approve a pending approval node, or reject it to append feedback and retry the upstream task.",
       parameters: Type.Object(
         {
           approvalId: Type.String({ description: "Approval ID." }),
           action: ApprovalActionSchema,
-          rejectReason: Type.Optional(Type.String({ description: "Reason used when rejecting." })),
+          rejectReason: Type.Optional(Type.String({ description: "Feedback appended to the original task when rejecting." })),
         },
         { additionalProperties: false },
       ),
@@ -520,73 +384,6 @@ export function createOrchestratorTools(
         return jsonResult(
           await client.post(`/approvals/${params.approvalId}/reject`, {
             reject_reason: params.rejectReason ?? "",
-          }),
-        );
-      },
-    },
-    {
-      name: "orchestrator_list_sessions",
-      label: "Orchestrator List Sessions",
-      description: "List sessions for one agent.",
-      parameters: Type.Object({ agentId: Type.String() }, { additionalProperties: false }),
-      async execute(_toolCallId: string, params: SessionList) {
-        return jsonResult(await client.get(`/agents/${params.agentId}/sessions`));
-      },
-    },
-    {
-      name: "orchestrator_send_agent_message",
-      label: "Orchestrator Send Agent Message",
-      description: "Send a message to an agent session. Defaults to the main session.",
-      parameters: Type.Object(
-        {
-          agentId: Type.String({ description: "Target agent ID." }),
-          content: Type.String({ description: "Message content." }),
-          sessionId: Type.Optional(Type.String({ description: "Optional session ID. Defaults to main." })),
-        },
-        { additionalProperties: false },
-      ),
-      async execute(_toolCallId: string, params: SendMessage) {
-        const sessionId = params.sessionId?.trim() || "main";
-        return jsonResult(
-          await client.post(`/agents/${params.agentId}/sessions/${encodeURIComponent(sessionId)}/send`, {
-            content: params.content,
-          }),
-        );
-      },
-    },
-    {
-      name: "orchestrator_list_knowledge",
-      label: "Orchestrator List Knowledge",
-      description: "List knowledge items for an agent or team.",
-      parameters: KnowledgeListParamsSchema,
-      async execute(_toolCallId: string, params: KnowledgeList) {
-        return jsonResult(await client.get(scopePath(params.scope, params.targetId)));
-      },
-    },
-    {
-      name: "orchestrator_add_knowledge",
-      label: "Orchestrator Add Knowledge",
-      description: "Add a knowledge item for an agent or team.",
-      parameters: KnowledgeAddParamsSchema,
-      async execute(_toolCallId: string, params: KnowledgeAdd) {
-        return jsonResult(
-          await client.post(scopePath(params.scope, params.targetId), {
-            sourceType: params.sourceType,
-            sourcePath: params.sourcePath,
-            title: params.title,
-          }),
-        );
-      },
-    },
-    {
-      name: "orchestrator_search_knowledge",
-      label: "Orchestrator Search Knowledge",
-      description: "Search knowledge for an agent or team.",
-      parameters: KnowledgeSearchParamsSchema,
-      async execute(_toolCallId: string, params: KnowledgeSearch) {
-        return jsonResult(
-          await client.post(`${scopePath(params.scope, params.targetId)}/search`, {
-            query: params.query,
           }),
         );
       },

@@ -1,11 +1,11 @@
 """API Key authentication middleware.
 
 When `settings.api_key` is set (non-empty), all HTTP requests to /api/*
-(except /api/health) must include a valid API key via:
+(except /api/health and /health) must include a valid API key via:
   - Header: X-API-Key: <key>
   - Query param: ?api_key=<key>
 
-WebSocket (/ws) and health check (/api/health) are excluded.
+WebSocket (/ws) and health checks (/api/health, /health) are excluded.
 When `settings.api_key` is empty (default), authentication is disabled (dev mode).
 """
 
@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse
 from openclaw_orchestrator.config import settings
 
 # Paths that are always accessible without authentication
-_PUBLIC_PATHS = frozenset({"/api/health"})
+_PUBLIC_PATHS = frozenset({"/api/health", "/health"})
 
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
